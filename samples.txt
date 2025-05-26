@@ -1,0 +1,10 @@
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC57_Misty.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC64_S14-P6.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_1_BC27_OAC-01-26.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC09_SeCan-09-38C.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC46_OT10-02.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC48_OT11-02.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC45_OT11-09.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_2_BC38_McCall.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_1_BC65_91M10.fq.sorted.bam
+/home/omabd4/wgs_vs_gbs/gbs_bam/TS_1_BC72_Albinos.fq.sorted.bam
