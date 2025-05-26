@@ -135,7 +135,6 @@ The pipeline uses a transformer-based deep learning model for genotype imputatio
 
 3. **Output Layer**:
    - Three-class classification (0/1/2 for genotypes)
-   - Softmax output with phred-scaled likelihoods
 
 ## Contributing
 
@@ -162,7 +161,3 @@ If you use DeepGBSImpute in your research, please cite:
 ## Contact
 
 For questions and support, please open an issue on GitHub or contact the maintainer.
-
-## Acknowledgments
-
-- All contributors and users of the pipeline 
