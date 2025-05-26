@@ -1,28 +1,28 @@
-# DeepFastGBS
+# DeepGBSImpute
 
-A high-throughput genotyping-by-sequencing (GBS) pipeline integrating DeepVariant and GLnexus for accurate variant calling in plant genomics.
+A Reference-Free Deep Learning Approach for Genotype Imputation in Genotyping-by-Sequencing Data
 
 ## Overview
 
-DeepFastGBS is a comprehensive pipeline designed for efficient and accurate variant calling in plant genomics using Genotyping-by-Sequencing (GBS) data. The pipeline combines the power of DeepVariant for accurate variant calling with GLnexus for joint genotyping, optimized for plant genomes.
+DeepGBSImpute is a comprehensive pipeline designed for efficient and accurate genotype imputation in genomics. The pipeline uses a deep learning approach with a transformer-based architecture to predict missing genotypes in GBS (Genotyping-by-Sequencing) data.
 
 ## Features
 
-- High-throughput processing of GBS data
-- Accurate variant calling using DeepVariant
-- Joint genotyping with GLnexus
+- Reference-free genotype imputation for GBS data
+- Deep learning-based imputation using transformer architecture
+- Memory-efficient processing with window-based analysis
 - Comprehensive quality control metrics
 - Detailed performance reports and visualizations
-- Memory-efficient processing with window-based analysis
 - Support for both CPU and GPU processing
 - Detailed logging and error tracking
+- Transfer learning between genomic windows
 
 ## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/Omar-Abd-Elwahab/DeepFastGBS.git
-cd DeepFastGBS
+git clone https://github.com/Omar-Abd-Elwahab/DeepGBSImpute.git
+cd DeepGBSImpute
 ```
 
 2. Create and activate a virtual environment:
@@ -120,6 +120,23 @@ The pipeline includes comprehensive performance monitoring:
    - Variant statistics per window
    - Imputation quality metrics
 
+## Model Architecture
+
+The pipeline uses a transformer-based deep learning model for genotype imputation:
+
+1. **Feature Embedding**:
+   - Input features include allele frequency, heterozygosity, missing rate, normalized position, and quality scores
+   - Multi-layer embedding with layer normalization and GELU activation
+
+2. **Transformer Encoder**:
+   - Multi-head self-attention mechanism
+   - Positional encoding for sequence information
+   - Multiple transformer layers for capturing complex patterns
+
+3. **Output Layer**:
+   - Three-class classification (0/1/2 for genotypes)
+   - Softmax output with phred-scaled likelihoods
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
@@ -130,15 +147,15 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Citation
 
-If you use DeepFastGBS in your research, please cite:
+If you use DeepGBSImpute in your research, please cite:
 
 ```
-@software{DeepFastGBS,
+@software{DeepGBSImpute,
   author = {Omar Abd-Elwahab},
-  title = {DeepFastGBS: A high-throughput GBS pipeline for plant genomics},
-  year = {2024},
+  title = {DeepGBSImpute: A Reference-Free Deep Learning Approach for Genotype Imputation in Genotyping-by-Sequencing Data},
+  year = {2025},
   publisher = {GitHub},
-  url = {https://github.com/Omar-Abd-Elwahab/DeepFastGBS}
+  url = {https://github.com/Omar-Abd-Elwahab/DeepGBSImpute}
 }
 ```
 
@@ -148,6 +165,4 @@ For questions and support, please open an issue on GitHub or contact the maintai
 
 ## Acknowledgments
 
-- DeepVariant team for the variant calling model
-- GLnexus team for the joint genotyping tool
 - All contributors and users of the pipeline 
