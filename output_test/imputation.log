@@ -1,0 +1,180 @@
+2025-06-03 11:31:38,677 - INFO - 
+Analyzing input VCF file: soya_gbs_snps.vcf.gz
+2025-06-03 11:31:38,679 - INFO - Counting variants and missing genotypes...
+2025-06-03 11:31:45,973 - INFO - 
+VCF Statistics:
+2025-06-03 11:31:45,973 - INFO - Number of samples: 78
+2025-06-03 11:31:45,973 - INFO - Number of variants: 267899
+2025-06-03 11:31:45,973 - INFO - Total genotypes: 20896122
+2025-06-03 11:31:45,973 - INFO - Missing genotypes: 13781780 (65.95%)
+2025-06-03 11:31:52,631 - INFO - 
+Creating windows from soya_gbs_snps.vcf.gz...
+2025-06-03 11:32:11,461 - INFO - Starting training...
+2025-06-03 11:52:02,382 - INFO - 
+Epoch 1/5 Summary:
+2025-06-03 11:52:02,382 - INFO - Training Metrics:
+2025-06-03 11:52:02,382 - INFO -   accuracy: 0.3377
+2025-06-03 11:52:02,382 - INFO -   macro_f1: 0.7554
+2025-06-03 11:52:02,383 - INFO -   weighted_f1: 0.7103
+2025-06-03 11:52:02,383 - INFO -   macro_precision: 0.7164
+2025-06-03 11:52:02,383 - INFO -   weighted_precision: 0.6451
+2025-06-03 11:52:02,383 - INFO -   macro_recall: 0.9716
+2025-06-03 11:52:02,383 - INFO -   weighted_recall: 0.9960
+2025-06-03 11:52:02,383 - INFO -   loss: 0.0210
+2025-06-03 11:52:02,383 - INFO - Validation Metrics:
+2025-06-03 11:52:02,383 - INFO -   accuracy: 0.9923
+2025-06-03 11:52:02,383 - INFO -   macro_f1: 0.9714
+2025-06-03 11:52:02,383 - INFO -   weighted_f1: 0.9939
+2025-06-03 11:52:02,383 - INFO -   macro_precision: 0.9728
+2025-06-03 11:52:02,383 - INFO -   weighted_precision: 0.9976
+2025-06-03 11:52:02,383 - INFO -   macro_recall: 0.9713
+2025-06-03 11:52:02,383 - INFO -   weighted_recall: 0.9923
+2025-06-03 11:52:02,383 - INFO -   loss: 0.0479
+2025-06-03 11:52:02,383 - INFO - Best Metrics So Far:
+2025-06-03 11:52:02,383 - INFO -   macro_f1: 0.9714
+2025-06-03 11:52:02,384 - INFO -   weighted_f1: 0.9939
+2025-06-03 11:52:02,384 - INFO -   loss: 0.0479
+2025-06-03 11:52:02,384 - INFO - Timing:
+2025-06-03 11:52:02,384 - INFO -   Training time: 488.98 seconds
+2025-06-03 11:52:02,384 - INFO -   Validation time: 701.94 seconds
+2025-06-03 11:52:02,384 - INFO -   Total epoch time: 1190.92 seconds
+2025-06-03 12:11:46,898 - INFO - 
+Epoch 2/5 Summary:
+2025-06-03 12:11:46,898 - INFO - Training Metrics:
+2025-06-03 12:11:46,898 - INFO -   accuracy: 0.3381
+2025-06-03 12:11:46,898 - INFO -   macro_f1: 0.7589
+2025-06-03 12:11:46,899 - INFO -   weighted_f1: 0.7149
+2025-06-03 12:11:46,899 - INFO -   macro_precision: 0.7207
+2025-06-03 12:11:46,899 - INFO -   weighted_precision: 0.6509
+2025-06-03 12:11:46,899 - INFO -   macro_recall: 0.9733
+2025-06-03 12:11:46,899 - INFO -   weighted_recall: 0.9974
+2025-06-03 12:11:46,899 - INFO -   loss: 0.0149
+2025-06-03 12:11:46,899 - INFO - Validation Metrics:
+2025-06-03 12:11:46,899 - INFO -   accuracy: 0.9984
+2025-06-03 12:11:46,899 - INFO -   macro_f1: 0.9735
+2025-06-03 12:11:46,899 - INFO -   weighted_f1: 0.9984
+2025-06-03 12:11:46,899 - INFO -   macro_precision: 0.9734
+2025-06-03 12:11:46,899 - INFO -   weighted_precision: 0.9984
+2025-06-03 12:11:46,899 - INFO -   macro_recall: 0.9737
+2025-06-03 12:11:46,899 - INFO -   weighted_recall: 0.9984
+2025-06-03 12:11:46,899 - INFO -   loss: 0.0059
+2025-06-03 12:11:46,899 - INFO - Best Metrics So Far:
+2025-06-03 12:11:46,899 - INFO -   macro_f1: 0.9735
+2025-06-03 12:11:46,899 - INFO -   weighted_f1: 0.9984
+2025-06-03 12:11:46,899 - INFO -   loss: 0.0059
+2025-06-03 12:11:46,899 - INFO - Timing:
+2025-06-03 12:11:46,899 - INFO -   Training time: 488.94 seconds
+2025-06-03 12:11:46,900 - INFO -   Validation time: 695.58 seconds
+2025-06-03 12:11:46,900 - INFO -   Total epoch time: 1184.51 seconds
+2025-06-03 12:31:47,042 - INFO - 
+Epoch 3/5 Summary:
+2025-06-03 12:31:47,042 - INFO - Training Metrics:
+2025-06-03 12:31:47,042 - INFO -   accuracy: 0.3382
+2025-06-03 12:31:47,042 - INFO -   macro_f1: 0.7590
+2025-06-03 12:31:47,042 - INFO -   weighted_f1: 0.7148
+2025-06-03 12:31:47,042 - INFO -   macro_precision: 0.7209
+2025-06-03 12:31:47,042 - INFO -   weighted_precision: 0.6508
+2025-06-03 12:31:47,043 - INFO -   macro_recall: 0.9736
+2025-06-03 12:31:47,043 - INFO -   weighted_recall: 0.9978
+2025-06-03 12:31:47,043 - INFO -   loss: 0.0115
+2025-06-03 12:31:47,043 - INFO - Validation Metrics:
+2025-06-03 12:31:47,043 - INFO -   accuracy: 0.9984
+2025-06-03 12:31:47,043 - INFO -   macro_f1: 0.9732
+2025-06-03 12:31:47,043 - INFO -   weighted_f1: 0.9985
+2025-06-03 12:31:47,043 - INFO -   macro_precision: 0.9734
+2025-06-03 12:31:47,043 - INFO -   weighted_precision: 0.9989
+2025-06-03 12:31:47,043 - INFO -   macro_recall: 0.9735
+2025-06-03 12:31:47,043 - INFO -   weighted_recall: 0.9984
+2025-06-03 12:31:47,043 - INFO -   loss: 0.0131
+2025-06-03 12:31:47,043 - INFO - Best Metrics So Far:
+2025-06-03 12:31:47,043 - INFO -   macro_f1: 0.9735
+2025-06-03 12:31:47,043 - INFO -   weighted_f1: 0.9985
+2025-06-03 12:31:47,043 - INFO -   loss: 0.0059
+2025-06-03 12:31:47,043 - INFO - Timing:
+2025-06-03 12:31:47,044 - INFO -   Training time: 500.13 seconds
+2025-06-03 12:31:47,044 - INFO -   Validation time: 700.01 seconds
+2025-06-03 12:31:47,044 - INFO -   Total epoch time: 1200.14 seconds
+2025-06-03 12:51:42,855 - INFO - 
+Epoch 4/5 Summary:
+2025-06-03 12:51:42,856 - INFO - Training Metrics:
+2025-06-03 12:51:42,856 - INFO -   accuracy: 0.3383
+2025-06-03 12:51:42,856 - INFO -   macro_f1: 0.7594
+2025-06-03 12:51:42,856 - INFO -   weighted_f1: 0.7156
+2025-06-03 12:51:42,856 - INFO -   macro_precision: 0.7214
+2025-06-03 12:51:42,856 - INFO -   weighted_precision: 0.6518
+2025-06-03 12:51:42,856 - INFO -   macro_recall: 0.9738
+2025-06-03 12:51:42,856 - INFO -   weighted_recall: 0.9984
+2025-06-03 12:51:42,856 - INFO -   loss: 0.0076
+2025-06-03 12:51:42,856 - INFO - Validation Metrics:
+2025-06-03 12:51:42,856 - INFO -   accuracy: 0.9990
+2025-06-03 12:51:42,856 - INFO -   macro_f1: 0.9738
+2025-06-03 12:51:42,856 - INFO -   weighted_f1: 0.9990
+2025-06-03 12:51:42,856 - INFO -   macro_precision: 0.9738
+2025-06-03 12:51:42,857 - INFO -   weighted_precision: 0.9991
+2025-06-03 12:51:42,857 - INFO -   macro_recall: 0.9741
+2025-06-03 12:51:42,857 - INFO -   weighted_recall: 0.9990
+2025-06-03 12:51:42,857 - INFO -   loss: 0.0047
+2025-06-03 12:51:42,857 - INFO - Best Metrics So Far:
+2025-06-03 12:51:42,857 - INFO -   macro_f1: 0.9738
+2025-06-03 12:51:42,857 - INFO -   weighted_f1: 0.9990
+2025-06-03 12:51:42,857 - INFO -   loss: 0.0047
+2025-06-03 12:51:42,857 - INFO - Timing:
+2025-06-03 12:51:42,857 - INFO -   Training time: 491.55 seconds
+2025-06-03 12:51:42,857 - INFO -   Validation time: 704.27 seconds
+2025-06-03 12:51:42,857 - INFO -   Total epoch time: 1195.81 seconds
+2025-06-03 13:11:44,716 - INFO - 
+Epoch 5/5 Summary:
+2025-06-03 13:11:44,716 - INFO - Training Metrics:
+2025-06-03 13:11:44,716 - INFO -   accuracy: 0.3383
+2025-06-03 13:11:44,716 - INFO -   macro_f1: 0.7590
+2025-06-03 13:11:44,716 - INFO -   weighted_f1: 0.7147
+2025-06-03 13:11:44,716 - INFO -   macro_precision: 0.7211
+2025-06-03 13:11:44,716 - INFO -   weighted_precision: 0.6512
+2025-06-03 13:11:44,717 - INFO -   macro_recall: 0.9733
+2025-06-03 13:11:44,717 - INFO -   weighted_recall: 0.9976
+2025-06-03 13:11:44,717 - INFO -   loss: 0.0168
+2025-06-03 13:11:44,717 - INFO - Validation Metrics:
+2025-06-03 13:11:44,717 - INFO -   accuracy: 0.9985
+2025-06-03 13:11:44,717 - INFO -   macro_f1: 0.9732
+2025-06-03 13:11:44,717 - INFO -   weighted_f1: 0.9985
+2025-06-03 13:11:44,717 - INFO -   macro_precision: 0.9732
+2025-06-03 13:11:44,717 - INFO -   weighted_precision: 0.9986
+2025-06-03 13:11:44,717 - INFO -   macro_recall: 0.9735
+2025-06-03 13:11:44,717 - INFO -   weighted_recall: 0.9985
+2025-06-03 13:11:44,717 - INFO -   loss: 0.0072
+2025-06-03 13:11:44,717 - INFO - Best Metrics So Far:
+2025-06-03 13:11:44,717 - INFO -   macro_f1: 0.9738
+2025-06-03 13:11:44,717 - INFO -   weighted_f1: 0.9990
+2025-06-03 13:11:44,717 - INFO -   loss: 0.0047
+2025-06-03 13:11:44,717 - INFO - Timing:
+2025-06-03 13:11:44,717 - INFO -   Training time: 503.82 seconds
+2025-06-03 13:11:44,717 - INFO -   Validation time: 698.04 seconds
+2025-06-03 13:11:44,717 - INFO -   Total epoch time: 1201.86 seconds
+2025-06-03 13:11:44,717 - INFO - 
+Evaluating on test set...
+2025-06-03 13:14:37,314 - INFO - 
+Test Phase Summary:
+2025-06-03 13:14:37,315 - INFO - Test time: 172.60 seconds
+2025-06-03 13:14:37,316 - INFO -   accuracy: 0.9988
+2025-06-03 13:14:37,316 - INFO -   macro_f1: 0.9721
+2025-06-03 13:14:37,316 - INFO -   weighted_f1: 0.9987
+2025-06-03 13:14:37,316 - INFO -   macro_precision: 0.9725
+2025-06-03 13:14:37,317 - INFO -   weighted_precision: 0.9991
+2025-06-03 13:14:37,317 - INFO -   macro_recall: 0.9723
+2025-06-03 13:14:37,317 - INFO -   weighted_recall: 0.9988
+2025-06-03 13:14:37,317 - INFO -   loss: 0.0074
+2025-06-03 13:14:37,317 - INFO -   confusion_matrix:
+2025-06-03 13:14:37,317 - INFO -     [[678982    347    217]
+ [     0 200637     17]
+ [    62      0 558301]]
+2025-06-03 13:14:38,838 - INFO - 
+Writing imputed genotypes to output_test/imputed.vcf.gz
+2025-06-03 13:14:38,842 - INFO - Processing and writing variants in windows...
+2025-06-03 13:23:53,473 - INFO - VCF writing completed in 554.64 seconds
+2025-06-03 13:23:53,474 - INFO - 
+Pipeline Timing Summary:
+2025-06-03 13:23:53,474 - INFO - Total pipeline time: 6734.80 seconds (112.25 minutes)
+2025-06-03 13:23:53,474 - INFO - Average training time per epoch: 494.68 seconds
+2025-06-03 13:23:53,474 - INFO - Average validation time per epoch: 699.97 seconds
+2025-06-03 13:23:53,474 - INFO - Average test time: 172.60 seconds
+2025-06-03 13:23:53,474 - INFO - Imputation time: 554.64 seconds
