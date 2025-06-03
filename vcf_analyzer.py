@@ -8,10 +8,10 @@ from multiprocessing import Pool, cpu_count
 from functools import partial
 import pandas as pd
 from sklearn.model_selection import KFold
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, accuracy_score
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset, random_split
 import psutil
 import GPUtil
 import json
@@ -28,11 +28,34 @@ from scipy.stats import mode
 import shutil
 import glob
 import errno
+import copy
+import warnings
+import torch.nn.functional as F
+import math
+import torch.optim as optim
+import torch.cuda.amp as amp
+import gzip
+from tqdm import tqdm
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.modules.module')
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='numpy.core.fromnumeric')
+warnings.filterwarnings('ignore', category=FutureWarning, module='pandas.core.dtypes.common')
+
+# Set PyTorch to use deterministic algorithms if needed
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+# Set numpy to use a fixed random seed
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 
 class GenotypeDataset(Dataset):
     def __init__(self, features, labels):
         self.features = torch.FloatTensor(features)
-        self.labels = torch.LongTensor(labels)
+        self.labels = torch.FloatTensor(labels)
     
     def __len__(self):
         return len(self.labels)
@@ -47,17 +70,26 @@ class GenotypeDataset(Dataset):
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        self.register_buffer('pe', self._get_pe(max_len, d_model))
+
+    def _get_pe(self, length, d_model):
+        pe = torch.zeros(length, d_model)
+        position = torch.arange(0, length, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+        return pe
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        seq_len = x.size(1)
+        if seq_len > self.pe.size(0):
+            # Expand positional encoding if needed
+            new_pe = self._get_pe(seq_len, self.d_model).to(x.device)
+            self.pe = new_pe
+        return x + self.pe[:seq_len, :].unsqueeze(0)
 
 def safe_norm(norm_layer, x):
     # Only apply normalization if batch size > 1
@@ -66,140 +98,179 @@ def safe_norm(norm_layer, x):
     return x
 
 class ImputationModel(nn.Module):
-    def __init__(self, input_size, hidden_size=512, nhead=8, num_layers=6, dropout=0.3):
-        super(ImputationModel, self).__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
+    def __init__(self, input_dim=2, hidden_dim=256, num_heads=8, num_layers=4, dropout=0.1):
+        super().__init__()
+        self.hidden_size = hidden_dim
         
-        # Enhanced feature embedding
-        self.embedding_fc1 = nn.Linear(input_size, hidden_size)
-        self.embedding_fc2 = nn.Linear(hidden_size, hidden_size)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.norm3 = nn.LayerNorm(hidden_size // 2)
+        # Input normalization
+        self.input_norm = nn.LayerNorm(input_dim + 1)  # +1 for position
         
-        self.dropout = nn.Dropout(dropout)
-        self.relu = nn.ReLU()
-        self.gelu = nn.GELU()
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim + 1, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
         
         # Positional encoding
-        self.pos_encoder = PositionalEncoding(hidden_size)
+        self.pos_encoder = PositionalEncoding(hidden_dim)
         
-        # Transformer encoder
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=nhead,
-            dim_feedforward=hidden_size * 4,
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
             dropout=dropout,
+            activation='gelu',
             batch_first=True,
-            activation='gelu'
+            norm_first=False
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Multi-head attention
-        self.attention = nn.MultiheadAttention(hidden_size, nhead, dropout=dropout, batch_first=True)
-        
-        # Output layers
-        self.fc1 = nn.Linear(hidden_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.fc3 = nn.Linear(hidden_size // 2, 3)
+        # Output head
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 3)  # 3 possible genotypes: 0/0, 0/1 or 1/0, 1/1
+        )
         
         # Initialize weights
-        self._init_weights()
+        self.apply(self._init_weights)
     
-    def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
     
-    def forward(self, x):
-        if len(x.shape) == 2:
-            x = x.unsqueeze(1)
-        # Embedding
-        identity = x.squeeze(1)
-        x = self.embedding_fc1(x.squeeze(1))
-        x = self.norm1(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.embedding_fc2(x)
-        x = self.norm2(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        # No residual here (shapes don't match)
-        x = x.unsqueeze(1)
+    def forward(self, x, positions=None):
+        # Add position information
+        if positions is not None:
+            x = torch.cat([x, positions], dim=-1)
+        
+        # Input normalization and projection
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        
+        # Add positional encoding
         x = self.pos_encoder(x)
-        # Transformer
-        transformer_out = self.transformer_encoder(x)
-        x = x + transformer_out
-        # Attention
-        attn_output, _ = self.attention(x, x, x)
-        x = x + attn_output
-        # Final classification
-        x = x.squeeze(1)
-        identity = x
-        x = self.fc1(x)
-        x = self.norm2(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        # Residual only if shapes match
-        if x.shape == identity.shape:
-            x = x + identity
-        identity = x
-        x = self.fc2(x)
-        x = self.norm3(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        if x.shape == identity.shape:
-            x = x + identity
-        x = self.fc3(x)
+        
+        # Transformer layers
+        x = self.transformer(x)
+        
+        # Output head
+        x = self.output_head(x)
+        
         return x
 
-def calculate_ld(variants, max_distance=10000):
+class GenotypeLoss(nn.Module):
+    def __init__(self, class_weights=None):
+        super().__init__()
+        self.class_weights = class_weights
+    
+    def forward(self, pred, target):
+        # Ensure target is the right shape for cross entropy
+        if len(target.shape) == 1:
+            target = target.long()  # Ensure target is long type
+        
+        # Calculate loss with class weights if provided
+        if self.class_weights is not None:
+            loss = F.cross_entropy(pred, target, weight=self.class_weights)
+        else:
+            loss = F.cross_entropy(pred, target)
+        return loss
+
+def calculate_class_weights(genotype_distribution):
+    """Calculate class weights based on genotype distribution."""
+    # Extract counts from the unphased genotype distribution
+    counts = genotype_distribution['unphased']
+    
+    # Initialize all possible genotypes with a small count
+    all_genotypes = {'0/0': 1, '0/1': 1, '1/0': 1, '1/1': 1}
+    
+    # Update with actual counts from the data
+    for genotype, count in counts.items():
+        if genotype != './.':  # Skip missing genotypes
+            all_genotypes[genotype] = max(count, 1)  # Ensure at least count of 1
+    
+    # Calculate total count of valid genotypes
+    total = sum(all_genotypes.values())
+    
+    # Calculate weights with a softer balancing approach
+    # Use square root of inverse frequency to reduce extreme weights
+    weights = {genotype: np.sqrt(total / (count * len(all_genotypes))) 
+              for genotype, count in all_genotypes.items()}
+    
+    # Convert to tensor
+    weight_tensor = torch.tensor([weights[g] for g in ['0/0', '0/1', '1/0', '1/1']], 
+                               dtype=torch.float32)
+    
+    # Normalize weights to have mean 1.0
+    weight_tensor = weight_tensor / weight_tensor.mean()
+    
+    return weight_tensor
+
+def calculate_ld(variants):
     """
-    Calculate Linkage Disequilibrium between variants.
+    Calculate linkage disequilibrium (LD) between variants using r².
     
     Args:
-        variants: List of variant objects
-        max_distance: Maximum distance between variants to calculate LD
+        variants: List of variant objects containing genotype information
         
     Returns:
-        dict: LD values between variant pairs
+        Dictionary mapping variant position pairs to LD information
     """
     ld_values = {}
-    for i, var1 in enumerate(variants):
-        for j, var2 in enumerate(variants[i+1:], i+1):
-            # Only calculate LD for variants within max_distance
-            if abs(var1.POS - var2.POS) > max_distance:
+    n_variants = len(variants)
+    
+    # For each pair of variants
+    for i in range(n_variants):
+        for j in range(i + 1, n_variants):
+            var1 = variants[i]
+            var2 = variants[j]
+            
+            # Skip if variants are too far apart (e.g., > 1Mb)
+            if abs(var1.POS - var2.POS) > 1_000_000:
                 continue
                 
-            # Calculate D' and r²
-            genotypes1 = [g[0] for g in var1.genotypes if g[0] != -1]
-            genotypes2 = [g[0] for g in var2.genotypes if g[0] != -1]
+            # Extract allele frequencies
+            p1 = sum(1 for gt in var1.genotypes if gt[0] == 1 or gt[1] == 1) / (2 * len(var1.genotypes))
+            p2 = sum(1 for gt in var2.genotypes if gt[0] == 1 or gt[1] == 1) / (2 * len(var2.genotypes))
             
-            if not genotypes1 or not genotypes2:
-                continue
-                
-            # Calculate allele frequencies
-            p1 = sum(genotypes1) / (2 * len(genotypes1))
-            p2 = sum(genotypes2) / (2 * len(genotypes2))
-            
-            # Calculate D
+            # Calculate D (linkage disequilibrium coefficient)
             D = 0
-            for g1, g2 in zip(genotypes1, genotypes2):
-                D += (g1/2 - p1) * (g2/2 - p2)
-            D /= len(genotypes1)
+            n_samples = len(var1.genotypes)
+            for k in range(n_samples):
+                gt1 = var1.genotypes[k]
+                gt2 = var2.genotypes[k]
+                
+                # Skip if either genotype is missing
+                if gt1[0] == -1 or gt2[0] == -1:
+                    continue
+                
+                # Count alleles
+                a1 = gt1[0] + gt1[1]  # Number of alternate alleles for variant 1
+                a2 = gt2[0] + gt2[1]  # Number of alternate alleles for variant 2
+                
+                # Update D
+                D += (a1/2 - p1) * (a2/2 - p2)
             
-            # Calculate D'
-            Dmax = min(p1*(1-p2), (1-p1)*p2) if D > 0 else min(p1*p2, (1-p1)*(1-p2))
-            Dprime = D / Dmax if Dmax != 0 else 0
+            D /= n_samples
             
             # Calculate r²
-            r2 = (D**2) / (p1*(1-p1)*p2*(1-p2)) if p1*(1-p1)*p2*(1-p2) != 0 else 0
+            r2 = (D * D) / (p1 * (1-p1) * p2 * (1-p2)) if p1 * (1-p1) * p2 * (1-p2) > 0 else 0
             
+            # Store LD information
             ld_values[(var1.POS, var2.POS)] = {
-                'Dprime': Dprime,
                 'r2': r2,
-                'distance': abs(var1.POS - var2.POS)
+                'D': D,
+                'p1': p1,
+                'p2': p2
             }
     
     return ld_values
@@ -231,39 +302,52 @@ def setup_logger(log_file='imputation_diagnostics.log'):
     
     return logger
 
-def extract_features(variants, logger=None):
-    if not variants:
-        return None, None
-    features = []
-    labels = []
-    all_positions = [v.POS for v in variants]
-    min_pos = min(all_positions) if all_positions else 0
-    max_pos = max(all_positions) if all_positions else 1
-    for variant in variants:
-        genotypes = [g[0] for g in variant.genotypes if g[0] != -1]
-        if not genotypes:
-            continue
-        af = sum(genotypes) / (2 * len(genotypes))
-        het = sum(1 for g in genotypes if g == 1) / len(genotypes)
-        missing_rate = 1 - (len(genotypes) / len(variant.genotypes))
-        norm_pos = (variant.POS - min_pos) / (max_pos - min_pos + 1e-8)
-        norm_qual = (variant.QUAL if variant.QUAL is not None else 0) / 1000.0
-        for sample_idx, genotype in enumerate(variant.genotypes):
-            if genotype[0] == -1:
-                continue
-            feature_vector = [af, het, missing_rate, norm_pos, len(genotypes), norm_qual]
-            features.append(feature_vector)
-            labels.append(genotype[0])
-    features = np.array(features) if features else None
-    labels = np.array(labels) if labels else None
-    if logger:
-        if features is not None and (np.any(np.isnan(features)) or np.any(np.isinf(features))):
-            logger.warning(f"[DIAG] NaN/Inf in features. Features sample: {features[:5]}")
-        if labels is not None and (np.any(np.isnan(labels)) or np.any(np.isinf(labels))):
-            logger.warning(f"[DIAG] NaN/Inf in labels. Labels sample: {labels[:5]}")
-        if labels is not None and not np.all(np.isin(labels, [0, 1, 2])):
-            logger.warning(f"[DIAG] Invalid label values. Unique labels: {np.unique(labels)} Labels sample: {labels[:10]}")
-    return features, labels
+def extract_features(variants):
+    """Extract features and genotype class labels from a window of variants."""
+    num_variants = len(variants)
+    num_samples = len(variants[0].genotypes)
+    
+    # Initialize tensors
+    features = torch.zeros((num_samples, num_variants, 2))  # [samples, variants, alleles]
+    positions = torch.zeros((num_variants,))  # [variants]
+    missing_mask = torch.zeros((num_samples, num_variants), dtype=torch.bool)  # [samples, variants]
+    labels = torch.zeros((num_samples, num_variants), dtype=torch.long)  # [samples, variants]
+    
+    # Process each variant
+    for i, variant in enumerate(variants):
+        positions[i] = variant.POS
+        for j, genotype in enumerate(variant.genotypes):
+            if genotype[0] != -1:  # Not missing
+                features[j, i, 0] = genotype[0]
+                features[j, i, 1] = genotype[1]
+                # Convert alleles to class: 0/0=0, 0/1 or 1/0=1, 1/1=2
+                if genotype[0] == 0 and genotype[1] == 0:
+                    labels[j, i] = 0  # homozygous reference
+                elif (genotype[0] == 0 and genotype[1] == 1) or (genotype[0] == 1 and genotype[1] == 0):
+                    labels[j, i] = 1  # heterozygous
+                elif genotype[0] == 1 and genotype[1] == 1:
+                    labels[j, i] = 2  # homozygous alternate
+                else:
+                    labels[j, i] = 0  # fallback
+            else:
+                missing_mask[j, i] = True
+                labels[j, i] = -1  # Mark missing as -1
+    
+    # Normalize positions to [0, 1] range
+    if positions.numel() > 0:
+        min_pos = positions.min()
+        max_pos = positions.max()
+        if max_pos > min_pos:
+            positions = (positions - min_pos) / (max_pos - min_pos)
+    
+    # Add small noise to positions to prevent exact duplicates
+    positions = positions + torch.randn_like(positions) * 1e-6
+    
+    # Reshape positions to match features shape
+    positions = positions.unsqueeze(0).unsqueeze(-1)  # [1, variants, 1]
+    positions = positions.expand(num_samples, -1, -1)  # [samples, variants, 1]
+    
+    return features, positions, labels, missing_mask
 
 class ImputationTracker:
     def __init__(self):
@@ -307,1227 +391,816 @@ class ImputationTracker:
         """Get imputation statistics"""
         return self.imputation_stats
 
-def process_window(window_tuple, model, optimizer, criterion, device, early_stopping, memory_manager, args, logger=None, previous_model_state=None, imputation_tracker=None):
-    chrom, start, end, variants = window_tuple
-    window_start_time = time.time()  # Start timing
+def calculate_optimal_batch_size(available_memory, num_samples=10):
+    """Calculate optimal batch size based on available memory."""
+    # Estimate memory per sample (in MB)
+    memory_per_sample = 0.1  # Conservative estimate
     
-    features, labels = extract_features(variants, logger=logger)
-    if features is None or labels is None:
-        if logger: logger.warning(f"No valid genotypes for training in window {chrom}:{start}-{end}")
-        return None
+    # Calculate maximum batch size that fits in memory
+    max_batch_size = int(available_memory * 0.8 / memory_per_sample)  # Use 80% of available memory
+    
+    # Ensure batch size is at least 1 and at most 32
+    return max(1, min(32, max_batch_size))
 
-    # Move data to GPU if available
-    features = torch.FloatTensor(features).to(device)
-    labels = torch.LongTensor(labels).to(device)
-    
-    # Check if we have enough samples for training
-    if len(features) < 2:
-        if logger: logger.warning(f"Not enough samples in window {chrom}:{start}-{end} for training")
-        return None
-    
-    # Create dataset and dataloader with multiple workers
-    dataset = GenotypeDataset(features.cpu().numpy(), labels.cpu().numpy())
-    
-    # Adjust batch size if needed
-    batch_size = min(args.batch_size, len(dataset))  # Use batch size from arguments
-    if batch_size < 2:
-        if logger: logger.warning(f"Batch size too small in window {chrom}:{start}-{end}")
-        return None
-    
-    # Configure DataLoader with more robust settings
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,  # Use num_workers from arguments
-        pin_memory=True,
-        persistent_workers=False,
-        prefetch_factor=None,
-        drop_last=False
-    )
-    
-    # If we have a previous model state, load it
-    if previous_model_state is not None:
-        model.load_state_dict(previous_model_state)
-        if logger: logger.info(f"Loaded previous model state for window {chrom}:{start}-{end}")
-    
-    # Learning rate scheduler with warmup and cosine annealing
-    num_epochs = 50
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.learning_rate,  # Use learning_rate from arguments
-        epochs=num_epochs,
-        steps_per_epoch=len(dataloader),
-        pct_start=0.3,
-        div_factor=25.0,
-        final_div_factor=1000.0,
-        anneal_strategy='cos'
-    )
-    
-    model.train()
-    total_loss = 0
-    num_batches = 0
-    all_preds = []
-    all_targets = []
-    
-    # Training loop with gradient accumulation and patience
-    accumulation_steps = max(1, min(2, len(dataloader) // 2))
-    optimizer.zero_grad()
-    
-    # Early stopping parameters
-    best_loss = float('inf')
-    patience = 10
-    patience_counter = 0
-    min_delta = 0.001
-    best_model_state = None
-    
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        epoch_batches = 0
-        epoch_preds = []
-        epoch_targets = []
-        
-        for batch_idx, batch in enumerate(dataloader):
-            inputs = batch['input'].to(device, non_blocking=True)
-            targets = batch['target'].to(device, non_blocking=True)
-            
-            # Skip batches that are too small
-            if inputs.size(0) < 2:
-                continue
-            
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss = loss / accumulation_steps
-            loss.backward()
-            
-            if (batch_idx + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-            
-            epoch_loss += loss.item() * accumulation_steps
-            epoch_batches += 1
-            
-            preds = torch.argmax(outputs, dim=1)
-            epoch_preds.extend(preds.cpu().numpy())
-            epoch_targets.extend(targets.cpu().numpy())
-            memory_manager.check_memory()
-        
-        # Calculate macro F1 for this epoch
-        if epoch_batches > 0:
-            macro_f1 = f1_score(epoch_targets, epoch_preds, average='macro', zero_division=0)
-        else:
-            macro_f1 = 0.0
-        
-        # Log progress every 5 epochs
-        if (epoch + 1) % 5 == 0 and logger:
-            logger.info(f"Window {chrom}:{start}-{end} - Epoch {epoch+1}/{num_epochs} - Loss: {epoch_loss / max(1, epoch_batches):.4f} - Macro F1: {macro_f1:.4f}")
-        
-        # Early stopping check
-        avg_epoch_loss = epoch_loss / epoch_batches if epoch_batches > 0 else float('inf')
-        if avg_epoch_loss < best_loss - min_delta:
-            best_loss = avg_epoch_loss
-            patience_counter = 0
-            best_model_state = model.state_dict()
-        else:
-            patience_counter += 1
-        if patience_counter >= patience:
-            if logger: logger.info(f"Early stopping triggered at epoch {epoch+1}")
-            break
-        # Accumulate for window stats
-        all_preds.extend(epoch_preds)
-        all_targets.extend(epoch_targets)
-        total_loss += epoch_loss
-        num_batches += epoch_batches
-    
-    if num_batches == 0:
-        return None
-    
-    # Calculate metrics
-    avg_loss = total_loss / num_batches
-    accuracy = sum(p == t for p, t in zip(all_preds, all_targets)) / len(all_targets)
-    f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
-    precision = precision_score(all_targets, all_preds, average='macro', zero_division=0)
-    recall = recall_score(all_targets, all_preds, average='macro', zero_division=0)
-    conf_matrix = confusion_matrix(all_targets, all_preds, labels=[0, 1, 2])
-    early_stopping(avg_loss)
-    avg_mem, max_mem, avg_cpu, max_cpu, avg_gpu, max_gpu = memory_manager.get_memory_stats()
-    
-    # Calculate window processing time
-    window_time = time.time() - window_start_time
-    
-    # Impute missing genotypes for this window
-    if imputation_tracker is not None:
-        model.eval()
-        with torch.no_grad():
-            for variant in variants:
-                # Always process all variants in the window
-                current_genotypes = list(variant.genotypes)
-                missing_indices = [i for i, g in enumerate(current_genotypes) if g[0] == -1]
-                
-                if missing_indices:  # Only process if there are missing genotypes
-                    imputed_genotypes = predict_missing_genotypes(model, features, missing_indices, current_genotypes)
-                    if imputed_genotypes is not None:
-                        # Update only the missing genotypes
-                        for idx in missing_indices:
-                            current_genotypes[idx] = imputed_genotypes[idx]
-                        imputation_tracker.add_imputed_variant(chrom, variant.POS, current_genotypes)
-                        if logger:
-                            logger.info(f"Imputed {len(missing_indices)} genotypes for variant at {chrom}:{variant.POS}")
-    
-    return {
-        'loss': avg_loss,
-        'accuracy': accuracy,
-        'f1': f1,
-        'precision': precision,
-        'recall': recall,
-        'confusion_matrix': conf_matrix.tolist(),
-        'avg_memory_mb': avg_mem,
-        'max_memory_mb': max_mem,
-        'avg_cpu_percent': avg_cpu,
-        'max_cpu_percent': max_cpu,
-        'avg_gpu_percent': avg_gpu,
-        'max_gpu_percent': max_gpu,
-        'num_variants': len(variants),
-        'num_batches': num_batches,
-        'learning_rate': scheduler.get_last_lr()[0],
-        'epochs_trained': epoch + 1,
-        'model_state': best_model_state,
-        'all_predictions': all_preds,
-        'all_targets': all_targets,
-        'window_time': window_time,  # Add window processing time
-        'chromosome': chrom,  # Add window position information
-        'start_pos': start,
-        'end_pos': end
-    }
-
-def predict_missing_genotypes(model, features, missing_indices, original_genotypes):
-    """Predict missing genotypes using the trained model."""
-    model.eval()
-    with torch.no_grad():
-        predictions = model(features)
-        # Get probabilities using softmax
-        probs = torch.nn.functional.softmax(predictions, dim=1)
-        predicted_genotypes = torch.argmax(predictions, dim=1)
-        
-        # Convert predictions to numpy for easier handling
-        predicted_genotypes = predicted_genotypes.cpu().numpy()
-        probs = probs.cpu().numpy()
-        
-        # Create output array with original genotypes (extract only the genotype value)
-        output_genotypes = [g[0] if isinstance(g, (list, tuple)) else g for g in original_genotypes]
-        
-        # Update only missing genotypes
-        for idx in missing_indices:
-            if idx < len(output_genotypes):  # Ensure index is valid
-                output_genotypes[idx] = predicted_genotypes[idx]
-        
-        # Calculate PL values (phred-scaled likelihoods)
-        pl_values = (-10 * np.log10(probs + 1e-10)).astype(np.int32)  # Add small epsilon to avoid log(0)
-        
-        # For each sample, create a tuple of (genotype, phase, pl_values)
-        formatted_genotypes = []
-        for i in range(len(output_genotypes)):
-            if i in missing_indices:  # Check if this index was missing
-                # For imputed genotypes, use the predicted value and calculated PLs
-                gt = int(output_genotypes[i])  # Convert to regular int
-                # Get phase information from original genotype if available
-                phase = original_genotypes[i][2] if len(original_genotypes[i]) > 2 else False
-                pls = pl_values[i].tolist()  # Convert to regular list
-                formatted_genotypes.append((gt, phase, pls))
-            else:
-                # For original genotypes, keep the original format
-                gt = int(output_genotypes[i])  # Convert to regular int
-                phase = original_genotypes[i][2] if len(original_genotypes[i]) > 2 else False
-                pls = original_genotypes[i][3:] if len(original_genotypes[i]) > 3 else [0, 0, 0]
-                formatted_genotypes.append((gt, phase, pls))
-        
-        return formatted_genotypes
-
-def create_imputed_vcf(input_vcf, output_vcf, imputation_tracker):
-    """Create a new VCF file with imputed genotypes."""
-    reader = cyvcf2.Reader(input_vcf)
-    writer = cyvcf2.Writer(output_vcf, reader)
-    
-    total_variants = 0
-    total_missing = 0
-    total_imputed = 0
-    
-    for variant in reader:
-        total_variants += 1
-        missing_count = sum(1 for gt in variant.gt_types if gt == -1)
-        total_missing += missing_count
-        
-        if missing_count > 0:
-            # Get imputed genotypes for this variant
-            variant_key = f"{variant.CHROM}:{variant.POS}"
-            if variant_key in imputation_tracker.imputed_variants:
-                imputed_genotypes = imputation_tracker.imputed_variants[variant_key]
-                
-                # Update genotypes in the variant
-                for i, (gt, phase, pls) in enumerate(imputed_genotypes):
-                    if variant.gt_types[i] == -1:  # Only update missing genotypes
-                        # Update genotype and PL values
-                        variant.gt_types[i] = gt
-                        variant.gt_phases[i] = phase
-                        variant.gt_pls[i] = pls
-                        total_imputed += 1
-                
-                # Update FORMAT fields
-                variant.FORMAT = "GT:PL"
-                
-        writer.write_record(variant)
-    
-    writer.close()
-    
-    # Log statistics
-    print(f"\nVCF Processing Statistics:")
-    print(f"Total variants processed: {total_variants}")
-    print(f"Total missing genotypes: {total_missing}")
-    print(f"Total genotypes imputed: {total_imputed}")
-    print(f"Imputation rate: {(total_imputed/total_missing)*100:.2f}%")
-
-def save_window_info(windows, output_file='window_info.txt'):
+def split_train_test(variants, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1, random_seed=42):
     """
-    Save detailed information about each window to a file.
-    
-    Args:
-        windows: List of window tuples (chrom, start, end, variants)
-        output_file: Path to output file
-    """
-    print(f"\nSaving window information to {output_file}")
-    
-    with open(output_file, 'w') as f:
-        # Write header
-        f.write("Window\tChromosome\tStart\tEnd\tTotal_Variants\tOverlap_Variants\n")
-        
-        # Process each window
-        for i, (chrom, start, end, variants) in enumerate(windows, 1):
-            # Get variant positions in current window
-            current_positions = set(v.POS for v in variants)
-            
-            # Calculate overlap with previous window
-            overlap_count = 0
-            if i > 1:
-                prev_chrom, prev_start, prev_end, prev_variants = windows[i-1]
-                if chrom == prev_chrom:  # Only calculate overlap for same chromosome
-                    prev_positions = set(v.POS for v in prev_variants)
-                    overlap_count = len(current_positions.intersection(prev_positions))
-            
-            # Write window information
-            f.write(f"{i}\t{chrom}\t{start:,}\t{end:,}\t{len(variants):,}\t{overlap_count:,}\n")
-    
-    print(f"Window information saved to {output_file}")
-
-def get_vcf_stats(vcf_path, device, memory_manager):
-    """
-    Calculate basic statistics and perform imputation.
-    
-    Args:
-        vcf_path (str): Path to the VCF file
-        device: Device to use for computation
-        memory_manager: Memory manager for large data handling
-        
-    Returns:
-        dict: Dictionary containing statistics and imputation results
-    """
-    if not os.path.exists(vcf_path):
-        raise FileNotFoundError(f"VCF file not found: {vcf_path}")
-    
-    try:
-        print(f"\nProcessing VCF file: {vcf_path}")
-        start_time = time.time()
-        
-        # Create windows
-        windows = create_windows(vcf_path)
-        
-        # Save window information
-        save_window_info(windows)
-        
-        # Process windows sequentially to maintain transfer learning
-        window_stats = []
-        previous_model = None
-        processed_windows = 0
-        skipped_windows = 0
-        
-        for i, window in enumerate(windows, 1):
-            print(f"\nProcessing window {i}/{len(windows)}")
-            stats = process_window(
-                window,
-                previous_model,
-                device,
-                memory_manager
-            )
-            
-            if stats is not None:
-                window_stats.append(stats)
-                previous_model = None
-                processed_windows += 1
-            else:
-                skipped_windows += 1
-        
-        print(f"\nProcessed {processed_windows} windows successfully")
-        print(f"Skipped {skipped_windows} windows due to errors or insufficient data")
-        
-        if not window_stats:
-            raise ValueError("No windows were successfully processed")
-        
-        # Create imputed VCF
-        output_vcf = vcf_path.replace('.vcf', '_imputed.vcf')
-        create_imputed_vcf(vcf_path, output_vcf, None)
-        
-        # Save metrics for later plotting
-        with open('imputation_metrics.json', 'w') as f:
-            json.dump(window_stats, f)
-        
-        # Get number of samples
-        reader = cyvcf2.Reader(vcf_path)
-        num_samples = len(reader.samples)
-        
-        # Calculate overall statistics
-        total_variants = sum(stat['num_variants'] for stat in window_stats)
-        chromosomes = set(stat['window_info']['chromosome'] for stat in window_stats)
-        
-        total_time = time.time() - start_time
-        
-        stats = {
-            'Number of samples': f"{num_samples:,}",
-            'Number of variants': f"{total_variants:,}",
-            'Number of chromosomes': f"{len(chromosomes):,}",
-            'Number of windows': f"{len(windows):,}",
-            'Processed windows': f"{processed_windows:,}",
-            'Skipped windows': f"{skipped_windows:,}",
-            'Total processing time': f"{total_time:.2f} seconds"
-        }
-        
-        return stats
-    
-    except Exception as e:
-        exc_type, exc_obj, exc_tb = sys.exc_info()
-        tb = traceback.extract_tb(exc_tb)
-        filename, line_no, func, text = tb[-1]
-        print(f"\nError in {filename}, line {line_no}, in {func}")
-        print(f"Error message: {str(e)}")
-        print(f"Code context: {text}")
-        print("\nFull traceback:")
-        traceback.print_exc()
-        sys.exit(1)
-
-def plot_metrics(metrics, output_dir='plots'):
-    """
-    Create comprehensive visualizations of imputation metrics.
-    
-    Args:
-        metrics: List of window metrics
-        output_dir: Directory to save plots
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Extract metrics
-    losses = [m['loss'] for m in metrics]
-    accuracies = [m['accuracy'] for m in metrics]
-    f1_scores = [m['f1'] for m in metrics]
-    precisions = [m['precision'] for m in metrics]
-    recalls = [m['recall'] for m in metrics]
-    learning_rates = [m['learning_rate'] for m in metrics]
-    memory_usage = [m['avg_memory_mb'] for m in metrics]
-    cpu_usage = [m['avg_cpu_percent'] for m in metrics]
-    gpu_usage = [m['avg_gpu_percent'] for m in metrics]
-    
-    # Create figure with subplots
-    plt.style.use('bmh')
-    fig = plt.figure(figsize=(20, 20))  # Increased figure height
-    
-    # Loss plot
-    ax1 = plt.subplot(4, 2, 1)  # Changed to 4x2 grid
-    ax1.plot(losses, label='Loss', color='blue')
-    ax1.set_title('Training Loss Over Windows')
-    ax1.set_xlabel('Window')
-    ax1.set_ylabel('Loss')
-    ax1.grid(True)
-    
-    # Accuracy metrics
-    ax2 = plt.subplot(4, 2, 2)  # Changed to 4x2 grid
-    ax2.plot(accuracies, label='Accuracy', color='green')
-    ax2.plot(f1_scores, label='F1 Score', color='red')
-    ax2.set_title('Accuracy Metrics')
-    ax2.set_xlabel('Window')
-    ax2.set_ylabel('Score')
-    ax2.legend()
-    ax2.grid(True)
-    
-    # Precision and Recall
-    ax3 = plt.subplot(4, 2, 3)  # Changed to 4x2 grid
-    ax3.plot(precisions, label='Precision', color='purple')
-    ax3.plot(recalls, label='Recall', color='orange')
-    ax3.set_title('Precision and Recall')
-    ax3.set_xlabel('Window')
-    ax3.set_ylabel('Score')
-    ax3.legend()
-    ax3.grid(True)
-    
-    # Learning rate
-    ax4 = plt.subplot(4, 2, 4)  # Changed to 4x2 grid
-    ax4.plot(learning_rates, color='brown')
-    ax4.set_title('Learning Rate')
-    ax4.set_xlabel('Window')
-    ax4.set_ylabel('Learning Rate')
-    ax4.grid(True)
-    
-    # Memory usage
-    ax5 = plt.subplot(4, 2, 5)  # Changed to 4x2 grid
-    ax5.plot(memory_usage, color='gray')
-    ax5.set_title('Memory Usage')
-    ax5.set_xlabel('Window')
-    ax5.set_ylabel('Memory (MB)')
-    ax5.grid(True)
-    
-    # CPU usage
-    ax6 = plt.subplot(4, 2, 6)  # Changed to 4x2 grid
-    ax6.plot(cpu_usage, label='CPU Usage', color='orange')
-    ax6.plot(gpu_usage, label='GPU Usage', color='purple')
-    ax6.set_title('CPU and GPU Usage')
-    ax6.set_xlabel('Window')
-    ax6.set_ylabel('Usage (%)')
-    ax6.legend()
-    ax6.grid(True)
-    
-    # Confusion matrix
-    ax7 = plt.subplot(4, 2, (7, 8))  # Changed to 4x2 grid, spanning last row
-    last_cm = np.array(metrics[-1]['confusion_matrix'])
-    sns.heatmap(last_cm, annot=True, fmt='d', cmap='Blues', ax=ax7,
-                xticklabels=['Homozygous Ref (0)', 'Heterozygous (1)', 'Homozygous Alt (2)'],
-                yticklabels=['Homozygous Ref (0)', 'Heterozygous (1)', 'Homozygous Alt (2)'])
-    ax7.set_title('Confusion Matrix (Last Window)')
-    
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/imputation_metrics.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Save metrics to JSON for later analysis
-    with open(f'{output_dir}/metrics.json', 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-def safe_process_window(window_info, previous_model=None, logger=None):
-    """
-    Safely process a window with error handling.
-    
-    Args:
-        window_info: Window information
-        previous_model: Previous model for transfer learning
-        logger: Logger instance
-        
-    Returns:
-        tuple: (metrics, model) or (None, None) if error
-    """
-    try:
-        return process_window(window_info, previous_model)
-    except Exception as e:
-        if logger:
-            logger.error(f"Error processing window {window_info[0]}:{window_info[1]}-{window_info[2]}: {str(e)}")
-        return None, None
-
-def calculate_population_genetics(variants):
-    """
-    Calculate population genetics statistics for variants.
+    Split known genotypes into training, validation and test sets while maintaining class balance.
+    Ensures no data leakage between sets by splitting at the variant level.
     
     Args:
         variants: List of variant objects
+        train_ratio: Ratio of known genotypes to use for training
+        val_ratio: Ratio of known genotypes to use for validation
+        test_ratio: Ratio of known genotypes to use for testing
+        random_seed: Random seed for reproducibility
         
     Returns:
-        dict: Population genetics statistics for each variant
+        tuple: (train_indices, val_indices, test_indices, test_true_values)
     """
-    stats = {}
-    for variant in variants:
-        # Get genotypes, excluding missing values
-        genotypes = [g[0] for g in variant.genotypes if g[0] != -1]
+    np.random.seed(random_seed)
+    
+    # First, split variants into train/val/test sets
+    n_variants = len(variants)
+    indices = np.arange(n_variants)
+    np.random.shuffle(indices)
+    
+    n_train = int(n_variants * train_ratio)
+    n_val = int(n_variants * val_ratio)
+    
+    train_variant_indices = indices[:n_train]
+    val_variant_indices = indices[n_train:n_train + n_val]
+    test_variant_indices = indices[n_train + n_val:]
+    
+    # Now collect genotypes for each set
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    # Process training variants
+    for var_idx in train_variant_indices:
+        variant = variants[var_idx]
+        for sample_idx, gt in enumerate(variant.genotypes):
+            if gt[0] != -1:  # Known genotype
+                train_indices.append((var_idx, sample_idx))
+    
+    # Process validation variants
+    for var_idx in val_variant_indices:
+        variant = variants[var_idx]
+        for sample_idx, gt in enumerate(variant.genotypes):
+            if gt[0] != -1:  # Known genotype
+                val_indices.append((var_idx, sample_idx))
+    
+    # Process test variants
+    for var_idx in test_variant_indices:
+        variant = variants[var_idx]
+        for sample_idx, gt in enumerate(variant.genotypes):
+            if gt[0] != -1:  # Known genotype
+                test_indices.append((var_idx, sample_idx))
+    
+    # Store true values for test set
+    test_true_values = []
+    for var_idx, sample_idx in test_indices:
+        test_true_values.append(variants[var_idx].genotypes[sample_idx])
+    
+    return train_indices, val_indices, test_indices, test_true_values
+
+class CosineAnnealingWarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
+    """Cosine annealing with warmup learning rate scheduler."""
+    def __init__(self, optimizer, warmup_steps, max_steps, min_lr=1e-6, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self.min_lr = min_lr
+        super(CosineAnnealingWarmupScheduler, self).__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            # Linear warmup
+            return [base_lr * (self.last_epoch / self.warmup_steps) for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing
+            progress = (self.last_epoch - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+            return [self.min_lr + (base_lr - self.min_lr) * 
+                   (1 + math.cos(math.pi * progress)) / 2 
+                   for base_lr in self.base_lrs]
+
+def get_device():
+    """Get the best available device with proper initialization."""
+    if torch.cuda.is_available():
+        try:
+            # Initialize CUDA
+            torch.cuda.init()
+            # Get device
+            device = torch.device('cuda')
+            # Test CUDA
+            torch.cuda.empty_cache()
+            return device
+        except Exception as e:
+            print(f"CUDA initialization failed: {e}. Falling back to CPU.")
+            return torch.device('cpu')
+    return torch.device('cpu')
+
+def calculate_metrics(predictions, targets, logger=None):
+    """Calculate comprehensive metrics for model evaluation."""
+    # Convert predictions and targets to numpy arrays if they are PyTorch tensors
+    if torch.is_tensor(predictions):
+        pred_np = predictions.cpu().numpy()
+    else:
+        pred_np = predictions
         
-        if not genotypes:
-            stats[variant.POS] = {
-                'allele_frequency': 0,
-                'heterozygosity': 0,
-                'missing_rate': 1.0
-            }
-            continue
-            
-        # Calculate allele frequency
-        af = sum(genotypes) / (2 * len(genotypes))
-        
-        # Calculate heterozygosity
-        het = sum(1 for g in genotypes if g == 1) / len(genotypes)
-        
-        # Calculate missing rate
-        total_samples = len(variant.genotypes)
-        missing_rate = 1 - (len(genotypes) / total_samples)
-        
-        stats[variant.POS] = {
-            'allele_frequency': af,
-            'heterozygosity': het,
-            'missing_rate': missing_rate
+    if torch.is_tensor(targets):
+        target_np = targets.cpu().numpy()
+    else:
+        target_np = targets
+    
+    # Handle empty arrays
+    if len(pred_np) == 0 or len(target_np) == 0:
+        return {
+            'accuracy': 0.0,
+            'macro_f1': 0.0,
+            'weighted_f1': 0.0,
+            'macro_precision': 0.0,
+            'weighted_precision': 0.0,
+            'macro_recall': 0.0,
+            'weighted_recall': 0.0,
+            'confusion_matrix': np.zeros((3, 3))  # Now 3x3 instead of 4x4
         }
     
-    return stats
-
-def optimize_performance():
-    """Set up performance optimizations"""
-    # Enable GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Define all possible labels (0/0, 0/1 or 1/0, 1/1)
+    all_labels = np.array([0, 1, 2])
     
-    # Set number of threads for CPU operations
-    torch.set_num_threads(cpu_count())
-    
-    # Enable cuDNN benchmarking for faster training
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-    
-    return device
-
-class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-        
-    def __call__(self, val_loss):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
-
-class MemoryManager:
-    def __init__(self):
-        self.temp_files = []
-        self.memory_usage = []
-        self.cpu_usage = []
-        self.gpu_usage = []
-    
-    def create_mmap_file(self, data):
-        """Create a memory-mapped file for large data"""
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
-        temp_file.write(data)
-        temp_file.close()
-        
-        with open(temp_file.name, 'rb') as f:
-            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        
-        self.temp_files.append((temp_file.name, mm))
-        return mm
-    
-    def check_memory(self):
-        """Record current memory usage (RAM), CPU, and GPU usage"""
-        import psutil
-        import GPUtil
-        
-        # Record RAM usage
-        process = psutil.Process(os.getpid())
-        mem_mb = process.memory_info().rss / 1024 / 1024
-        self.memory_usage.append(mem_mb)
-        
-        # Record CPU usage
-        cpu_percent = process.cpu_percent()
-        self.cpu_usage.append(cpu_percent)
-        
-        # Record GPU usage if available
-        if torch.cuda.is_available():
-            try:
-                gpus = GPUtil.getGPUs()
-                if gpus:
-                    gpu_percent = gpus[0].load * 100  # Get usage of first GPU
-                    self.gpu_usage.append(gpu_percent)
-            except:
-                self.gpu_usage.append(0)
-        else:
-            self.gpu_usage.append(0)
-    
-    def get_memory_stats(self):
-        """Return average and maximum memory, CPU, and GPU usage"""
-        if not self.memory_usage:
-            return 0, 0, 0, 0, 0, 0
-            
-        mem_avg = sum(self.memory_usage) / len(self.memory_usage)
-        mem_max = max(self.memory_usage)
-        
-        cpu_avg = sum(self.cpu_usage) / len(self.cpu_usage)
-        cpu_max = max(self.cpu_usage)
-        
-        gpu_avg = sum(self.gpu_usage) / len(self.gpu_usage)
-        gpu_max = max(self.gpu_usage)
-        
-        return mem_avg, mem_max, cpu_avg, cpu_max, gpu_avg, gpu_max
-    
-    def cleanup(self):
-        """Clean up temporary files and memory"""
-        for filename, mm in self.temp_files:
-            mm.close()
-            os.unlink(filename)
-        self.temp_files = []
-        gc.collect()
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-def checkpoint_model(model, optimizer, epoch, loss, path):
-    """Save model checkpoint with automatic cleanup of old checkpoints."""
+    # Calculate metrics
     try:
-        # Create temp directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        metrics = {
+            'accuracy': accuracy_score(target_np, pred_np),
+            'macro_f1': f1_score(target_np, pred_np, average='macro', zero_division=0, labels=all_labels),
+            'weighted_f1': f1_score(target_np, pred_np, average='weighted', zero_division=0, labels=all_labels),
+            'macro_precision': precision_score(target_np, pred_np, average='macro', zero_division=0, labels=all_labels),
+            'weighted_precision': precision_score(target_np, pred_np, average='weighted', zero_division=0, labels=all_labels),
+            'macro_recall': recall_score(target_np, pred_np, average='macro', zero_division=0, labels=all_labels),
+            'weighted_recall': recall_score(target_np, pred_np, average='weighted', zero_division=0, labels=all_labels)
+        }
         
-        # Remove previous checkpoint if it exists
-        if os.path.exists(path):
-            os.remove(path)
+        # Add confusion matrix with all labels
+        cm = confusion_matrix(target_np, pred_np, labels=all_labels)
+        metrics['confusion_matrix'] = cm
+        
+        return metrics
+    except Exception as e:
+        if logger:
+            logger.error(f"Error calculating metrics: {str(e)}")
+        return {
+            'accuracy': 0.0,
+            'macro_f1': 0.0,
+            'weighted_f1': 0.0,
+            'macro_precision': 0.0,
+            'weighted_precision': 0.0,
+            'macro_recall': 0.0,
+            'weighted_recall': 0.0,
+            'confusion_matrix': np.zeros((3, 3))  # Now 3x3 instead of 4x4
+        }
+
+def process_window(window, model, device, is_training=True, logger=None, optimizer=None):
+    """Process a single window for training or imputation."""
+    try:
+        chrom, start, end, variants = window
+        
+        # Skip empty windows
+        if not variants:
+            return {'loss': 0.0, 'accuracy': 0.0, 'macro_f1': 0.0, 'confusion_matrix': np.zeros((3, 3))}
+        
+        # Extract features and labels
+        features, positions, labels, missing_mask = extract_features(variants)
+        
+        # Move data to device
+        features = features.to(device)
+        positions = positions.to(device)
+        labels = labels.to(device)
+        missing_mask = missing_mask.to(device)
+        
+        if is_training:
+            model.train()
             
-        # Save new checkpoint
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss,
-        }, path)
-        
-        # Clean up old checkpoints (keep only the last 2)
-        checkpoint_dir = os.path.dirname(path)
-        checkpoints = sorted(glob.glob(os.path.join(checkpoint_dir, 'checkpoint_window_*.pt')))
-        if len(checkpoints) > 2:
-            for old_ckpt in checkpoints[:-2]:
-                try:
-                    os.remove(old_ckpt)
-                except OSError:
-                    pass  # Ignore errors during cleanup
+            # Forward pass
+            outputs = model(features, positions)
+            
+            # Calculate loss only on non-missing labels
+            valid_mask = (labels != -1)
+            if valid_mask.any():
+                # Apply log_softmax for numerical stability
+                log_probs = F.log_softmax(outputs, dim=-1)
+                
+                # Calculate loss
+                loss = F.nll_loss(
+                    log_probs.view(-1, 3)[valid_mask.view(-1)],
+                    labels.view(-1)[valid_mask.view(-1)]
+                )
+                
+                # Backward pass
+                if optimizer is not None:
+                    optimizer.zero_grad()
+                    loss.backward()
                     
-    except OSError as e:
-        if e.errno == errno.ENOSPC:
-            print("WARNING: No space left on device. Skipping checkpoint save.")
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                
+                # Calculate metrics
+                with torch.no_grad():
+                    predictions = torch.argmax(outputs, dim=-1)
+                    metrics = calculate_metrics(predictions.view(-1), labels.view(-1), logger)
+                    metrics['loss'] = loss.item()
+                
+                return metrics
+            else:
+                return {'loss': 0.0, 'accuracy': 0.0, 'macro_f1': 0.0, 'confusion_matrix': np.zeros((3, 3))}
         else:
-            raise
-    except RuntimeError as e:
-        if "No space left on device" in str(e):
-            print("WARNING: No space left on device. Skipping checkpoint save.")
-        else:
-            raise
+            model.eval()
+            with torch.no_grad():
+                # Forward pass
+                outputs = model(features, positions)
+                probs = F.softmax(outputs, dim=-1)
+                predictions = torch.argmax(probs, dim=-1)
+                
+                # Calculate metrics only on known genotypes
+                known_mask = ~missing_mask
+                metrics = calculate_metrics(
+                    predictions[known_mask].view(-1),
+                    labels[known_mask].view(-1),
+                    logger
+                )
+                metrics['loss'] = F.cross_entropy(outputs.view(-1, 3), labels.view(-1), ignore_index=-1).item()
+                
+                # Impute ALL missing genotypes
+                imputed_genotypes = []
+                for i, variant in enumerate(variants):
+                    variant_genotypes = []
+                    for j in range(len(variant.genotypes)):
+                        if missing_mask[j, i]:  # If genotype is missing
+                            pred = predictions[j, i].item()
+                            # Convert prediction to genotype
+                            if pred == 0:
+                                variant_genotypes.append((0, 0))  # 0/0
+                            elif pred == 1:
+                                variant_genotypes.append((0, 1))  # 0/1
+                            elif pred == 2:
+                                variant_genotypes.append((1, 1))  # 1/1
+                        else:
+                            variant_genotypes.append(variant.genotypes[j])
+                    imputed_genotypes.append(variant_genotypes)
+                
+                return metrics, imputed_genotypes
+    except Exception as e:
+        if logger:
+            logger.error(f"Error processing window: {str(e)}")
+        return {'loss': 0.0, 'accuracy': 0.0, 'macro_f1': 0.0, 'confusion_matrix': np.zeros((3, 3))}
 
-def cleanup_checkpoints(temp_dir='temp'):
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-
-def create_windows(vcf_path, window_size=150000, overlap=0.1, min_variants=50, min_samples=2):
-    """
-    Create sliding windows from VCF file, merging windows with too few samples.
-    Args:
-        vcf_path (str): Path to the VCF file
-        window_size (int): Size of each window in base pairs
-        overlap (float): Overlap between windows (0.1 = 10%)
-        min_variants (int): Minimum number of variants per window
-        min_samples (int): Minimum number of samples per window
-    Returns:
-        list: List of tuples (chrom, start, end, variants)
-    """
-    overlap_bp = int(window_size * overlap)  # Calculate overlap in base pairs
-    print(f"\nCreating windows of {window_size:,} bp with {overlap*100:.1f}% overlap ({overlap_bp:,} bp)")
+def create_windows(vcf_file, window_size=100000):
+    """Create windows from VCF file for transformer-based imputation."""
+    print(f"\nCreating windows of size {window_size:,} bp")
+    
+    # Initialize windows
     windows = []
-    current_window = []
     current_chrom = None
-    current_start = None
-    current_end = None
-    window_variants = 0
-    reader = cyvcf2.Reader(vcf_path)
+    current_window = []
+    window_start = None
+    window_end = None
+    
+    # Read variants
+    reader = cyvcf2.Reader(vcf_file)
     for variant in reader:
-        # Initialize window if this is the first variant
+        # Skip variants with no genotype information
+        if variant.gt_types is None:
+            continue
+            
         if current_chrom is None:
             current_chrom = variant.CHROM
-            current_start = variant.POS
-            current_end = current_start + window_size
-        # If we're on a new chromosome, save current window and start new one
-        if variant.CHROM != current_chrom:
-            if window_variants >= min_variants:
-                # Check sample count
-                sample_count = sum([sum(1 for g in v.genotypes if g[0] != -1) for v in current_window])
-                if sample_count >= min_samples:
-                    windows.append((current_chrom, current_start, current_end, current_window))
-                else:
-                    # Merge with next window (skip for now, will merge below)
-                    pass
+            window_start = variant.POS
+            window_end = window_start + window_size
+        
+        # If we're on a new chromosome or past the window end, save current window and start new one
+        if variant.CHROM != current_chrom or variant.POS >= window_end:
+            if current_window:  # Save window if it has variants
+                windows.append((current_chrom, window_start, window_end, current_window))
+            
+            # Start new window
             current_chrom = variant.CHROM
-            current_start = variant.POS
-            current_end = current_start + window_size
+            window_start = variant.POS
+            window_end = window_start + window_size
             current_window = []
-            window_variants = 0
-        # If variant is beyond current window
-        if variant.POS >= current_end:
-            if window_variants >= min_variants:
-                sample_count = sum([sum(1 for g in v.genotypes if g[0] != -1) for v in current_window])
-                if sample_count >= min_samples:
-                    windows.append((current_chrom, current_start, current_end, current_window))
-                    # Start new window with overlap
-                    current_start = int(current_end - overlap_bp)
-                    current_end = current_start + window_size
-                    current_window = []
-                    window_variants = 0
-                else:
-                    # Merge with next window: don't reset, just extend window
-                    current_end = variant.POS + window_size
-            else:
-                # Extend current window
-                current_end = variant.POS + window_size
-        # Add variant to current window
-        current_window.append(variant)
-        window_variants += 1
-    # Add the last window if it has enough variants and samples
-    if window_variants >= min_variants:
-        sample_count = sum([sum(1 for g in v.genotypes if g[0] != -1) for v in current_window])
-        if sample_count >= min_samples:
-            windows.append((current_chrom, current_start, current_end, current_window))
-    print(f"Created {len(windows):,} windows")
-    return windows
-
-def generate_reports(metrics, output_dir='reports'):
-    """
-    Generate comprehensive reports and visualizations for the imputation results.
-    Args:
-        metrics: List of window metrics
-        output_dir: Directory to save reports and plots
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Extract metrics
-    losses = [m['loss'] for m in metrics]
-    accuracies = [m['accuracy'] for m in metrics]
-    f1_scores = [m['f1'] for m in metrics]
-    precisions = [m['precision'] for m in metrics]
-    recalls = [m['recall'] for m in metrics]
-    learning_rates = [m['learning_rate'] for m in metrics]
-    memory_usage = [m['avg_memory_mb'] for m in metrics]
-    max_memory_usage = [m['max_memory_mb'] for m in metrics]
-    cpu_usage = [m['avg_cpu_percent'] for m in metrics]
-    max_cpu_usage = [m['max_cpu_percent'] for m in metrics]
-    gpu_usage = [m['avg_gpu_percent'] for m in metrics]
-    max_gpu_usage = [m['max_gpu_percent'] for m in metrics]
-    variants_per_window = [m['num_variants'] for m in metrics]
-    window_times = [m['window_time'] for m in metrics]
-    chromosomes = [m['chromosome'] for m in metrics]
-    start_positions = [m['start_pos'] for m in metrics]
-    end_positions = [m['end_pos'] for m in metrics]
-
-    # Calculate variant statistics
-    avg_variants = np.mean(variants_per_window)
-    min_variants = np.min(variants_per_window)
-    max_variants = np.max(variants_per_window)
-    std_variants = np.std(variants_per_window)
-
-    # Create window information file
-    window_info_file = os.path.join(output_dir, 'window_info.csv')
-    with open(window_info_file, 'w') as f:
-        f.write('Window,Chromosome,Start,End,NumVariants,ProcessingTime\n')
-        for i, (chrom, start, end, nvars, time) in enumerate(zip(chromosomes, start_positions, end_positions, variants_per_window, window_times)):
-            f.write(f'{i+1},{chrom},{start},{end},{nvars},{time:.2f}\n')
-
-    # Calculate macro and weighted metrics over all windows
-    macro_f1 = np.mean(f1_scores)
-    macro_precision = np.mean(precisions)
-    macro_recall = np.mean(recalls)
-    macro_accuracy = np.mean(accuracies)
-    weighted_f1 = np.average(f1_scores, weights=variants_per_window)
-    weighted_precision = np.average(precisions, weights=variants_per_window)
-    weighted_recall = np.average(recalls, weights=variants_per_window)
-    weighted_accuracy = np.average(accuracies, weights=variants_per_window)
-
-    # 1. Training Progress Dashboard
-    plt.style.use('bmh')
-    fig = plt.figure(figsize=(20, 15))
+        
+        # Add variant if it has any genotype information
+        if len(variant.gt_types) > 0:
+            current_window.append(variant)
     
-    # Loss plot
-    ax1 = plt.subplot(3, 2, 1)
-    ax1.plot(losses, label='Loss', color='blue')
-    ax1.set_title('Training Loss Over Windows')
-    ax1.set_xlabel('Window')
-    ax1.set_ylabel('Loss')
-    ax1.grid(True)
+    # Save the last window
+    if current_window:
+        windows.append((current_chrom, window_start, window_end, current_window))
     
-    # Accuracy metrics
-    ax2 = plt.subplot(3, 2, 2)
-    ax2.plot(accuracies, label='Accuracy', color='green')
-    ax2.plot(f1_scores, label='F1 Score', color='red')
-    ax2.set_title('Accuracy Metrics')
-    ax2.set_xlabel('Window')
-    ax2.set_ylabel('Score')
-    ax2.legend()
-    ax2.grid(True)
+    reader.close()
     
-    # Precision and Recall
-    ax3 = plt.subplot(3, 2, 3)
-    ax3.plot(precisions, label='Precision', color='purple')
-    ax3.plot(recalls, label='Recall', color='orange')
-    ax3.set_title('Precision and Recall')
-    ax3.set_xlabel('Window')
-    ax3.set_ylabel('Score')
-    ax3.legend()
-    ax3.grid(True)
+    # Split windows into train/test sets (80/20 split)
+    np.random.seed(42)
+    np.random.shuffle(windows)
+    split_idx = int(len(windows) * 0.8)
+    train_windows = windows[:split_idx]
+    test_windows = windows[split_idx:]
     
-    # Learning rate
-    ax4 = plt.subplot(3, 2, 4)
-    ax4.plot(learning_rates, color='brown')
-    ax4.set_title('Learning Rate')
-    ax4.set_xlabel('Window')
-    ax4.set_ylabel('Learning Rate')
-    ax4.grid(True)
+    print(f"\nWindow Statistics:")
+    print(f"Total windows: {len(windows)}")
+    print(f"Training windows: {len(train_windows)}")
+    print(f"Test windows: {len(test_windows)}")
     
-    # Memory usage
-    ax5 = plt.subplot(3, 2, 5)
-    ax5.plot(memory_usage, color='gray', label='Avg Mem')
-    ax5.plot(max_memory_usage, color='black', linestyle='--', label='Max Mem')
-    ax5.set_title('Memory Usage')
-    ax5.set_xlabel('Window')
-    ax5.set_ylabel('Memory (MB)')
-    ax5.legend()
-    ax5.grid(True)
-    
-    # CPU/GPU usage
-    ax6 = plt.subplot(3, 2, 6)
-    ax6.plot(cpu_usage, label='Avg CPU', color='orange')
-    ax6.plot(max_cpu_usage, label='Max CPU', color='red', linestyle='--')
-    ax6.plot(gpu_usage, label='Avg GPU', color='purple')
-    ax6.plot(max_gpu_usage, label='Max GPU', color='blue', linestyle='--')
-    ax6.set_title('CPU and GPU Usage')
-    ax6.set_xlabel('Window')
-    ax6.set_ylabel('Usage (%)')
-    ax6.legend()
-    ax6.grid(True)
-    
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/training_dashboard.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    return train_windows, test_windows
 
-    # 2. Performance Distribution Plots
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    sns.histplot(accuracies, kde=True, ax=axes[0, 0])
-    axes[0, 0].set_title('Accuracy Distribution')
-    axes[0, 0].set_xlabel('Accuracy')
-    sns.histplot(f1_scores, kde=True, ax=axes[0, 1])
-    axes[0, 1].set_title('F1 Score Distribution')
-    axes[0, 1].set_xlabel('F1 Score')
-    sns.histplot(losses, kde=True, ax=axes[1, 0])
-    axes[1, 0].set_title('Loss Distribution')
-    axes[1, 0].set_xlabel('Loss')
-    sns.histplot(variants_per_window, kde=True, ax=axes[1, 1])
-    axes[1, 1].set_title('Variants per Window Distribution')
-    axes[1, 1].set_xlabel('Number of Variants')
-    plt.tight_layout()
-    plt.savefig(f'{output_dir}/performance_distributions.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 3. Time per window plot
-    plt.figure(figsize=(12, 6))
-    plt.plot(window_times, marker='o')
-    plt.title('Processing Time per Window')
-    plt.xlabel('Window')
-    plt.ylabel('Time (seconds)')
-    plt.grid(True)
-    plt.savefig(f'{output_dir}/time_per_window.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 4. Window Performance Analysis
-    plt.figure(figsize=(15, 6))
-    plt.plot(variants_per_window, accuracies, 'o', alpha=0.5)
-    plt.title('Accuracy vs. Number of Variants per Window')
-    plt.xlabel('Number of Variants')
-    plt.ylabel('Accuracy')
-    plt.grid(True)
-    plt.savefig(f'{output_dir}/accuracy_vs_variants.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 5. Variants per Window Plot
-    plt.figure(figsize=(15, 6))
-    plt.plot(variants_per_window, marker='o')
-    plt.axhline(y=avg_variants, color='r', linestyle='--', label=f'Average: {avg_variants:.1f}')
-    plt.axhline(y=min_variants, color='g', linestyle='--', label=f'Minimum: {min_variants}')
-    plt.axhline(y=max_variants, color='b', linestyle='--', label=f'Maximum: {max_variants}')
-    plt.title('Number of Variants per Window')
-    plt.xlabel('Window')
-    plt.ylabel('Number of Variants')
+def plot_resource_usage(resource_history, output_dir):
+    """Plot GPU and CPU usage over time."""
+    plt.figure(figsize=(15, 5))
+    
+    # Plot GPU memory usage
+    plt.subplot(1, 2, 1)
+    plt.plot(resource_history['gpu_memory'], label='GPU Memory (MB)')
+    plt.title('GPU Memory Usage')
+    plt.xlabel('Time Step')
+    plt.ylabel('Memory (MB)')
     plt.legend()
-    plt.grid(True)
-    plt.savefig(f'{output_dir}/variants_per_window.png', dpi=300, bbox_inches='tight')
+    
+    # Plot CPU usage
+    plt.subplot(1, 2, 2)
+    plt.plot(resource_history['cpu_percent'], label='CPU Usage (%)')
+    plt.title('CPU Usage')
+    plt.xlabel('Time Step')
+    plt.ylabel('Usage (%)')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'resource_usage.png'))
     plt.close()
 
-    # 6. Generate Detailed Report
-    report = f"""Imputation Performance Report
-Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+def plot_window_statistics(window_stats, output_dir):
+    """Plot statistics about windows."""
+    plt.figure(figsize=(15, 5))
+    
+    # Plot missing genotypes per window
+    plt.subplot(1, 2, 1)
+    plt.hist(window_stats['missing_per_window'], bins=50)
+    plt.title('Distribution of Missing Genotypes per Window')
+    plt.xlabel('Number of Missing Genotypes')
+    plt.ylabel('Frequency')
+    
+    # Plot missing percentage per window
+    plt.subplot(1, 2, 2)
+    plt.hist(window_stats['missing_percentage'], bins=50)
+    plt.title('Distribution of Missing Percentage per Window')
+    plt.xlabel('Missing Percentage')
+    plt.ylabel('Frequency')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'window_statistics.png'))
+    plt.close()
 
-Overall Statistics:
------------------
-Total Windows Processed: {len(metrics)}
-Total Variants Processed: {sum(variants_per_window):,}
+def plot_genotype_distribution(genotype_counts, output_dir):
+    """Plot distribution of genotypes."""
+    plt.figure(figsize=(10, 5))
+    genotypes = ['0/0', '0/1', '1/1']
+    counts = [genotype_counts[gt] for gt in genotypes]
+    plt.bar(genotypes, counts)
+    plt.title('Distribution of Genotypes')
+    plt.xlabel('Genotype')
+    plt.ylabel('Count')
+    plt.savefig(os.path.join(output_dir, 'genotype_distribution.png'))
+    plt.close()
 
-Variant Statistics per Window:
-----------------------------
-Average Variants: {avg_variants:.1f} ± {std_variants:.1f}
-Minimum Variants: {min_variants}
-Maximum Variants: {max_variants}
+def monitor_resources():
+    """Monitor GPU and CPU usage."""
+    gpu_memory = 0
+    if torch.cuda.is_available():
+        gpu = GPUtil.getGPUs()[0]  # Get first GPU
+        gpu_memory = gpu.memoryUsed
+    
+    cpu_percent = psutil.cpu_percent()
+    return {'gpu_memory': gpu_memory, 'cpu_percent': cpu_percent}
 
-Accuracy Metrics (Macro):
-------------------------
-F1 Score: {macro_f1:.4f}
-Precision: {macro_precision:.4f}
-Recall: {macro_recall:.4f}
-Accuracy: {macro_accuracy:.4f}
-
-Accuracy Metrics (Weighted):
----------------------------
-F1 Score: {weighted_f1:.4f}
-Precision: {weighted_precision:.4f}
-Recall: {weighted_recall:.4f}
-Accuracy: {weighted_accuracy:.4f}
-
-Loss Statistics:
----------------
-Average Loss: {np.mean(losses):.4f} ± {np.std(losses):.4f}
-Minimum Loss: {np.min(losses):.4f}
-Maximum Loss: {np.max(losses):.4f}
-
-Resource Usage:
---------------
-Average Memory Usage: {np.mean(memory_usage):.2f} MB
-Maximum Memory Usage: {np.max(max_memory_usage):.2f} MB
-Average CPU Usage: {np.mean(cpu_usage):.2f}%
-Maximum CPU Usage: {np.max(max_cpu_usage):.2f}%
-Average GPU Usage: {np.mean(gpu_usage):.2f}%
-Maximum GPU Usage: {np.max(max_gpu_usage):.2f}%
-
-Processing Time:
----------------
-Total Processing Time: {sum(window_times):.2f} seconds
-Average Time per Window: {np.mean(window_times):.2f} seconds
-Minimum Time per Window: {np.min(window_times):.2f} seconds
-Maximum Time per Window: {np.max(window_times):.2f} seconds
-
-Performance Trends:
------------------
-Accuracy Trend: {trend_acc}
-F1 Score Trend: {trend_f1}
-Loss Trend: {trend_loss}
-""".format(
-        trend_acc='Improving' if accuracies[-1] > accuracies[0] else 'Declining',
-        trend_f1='Improving' if f1_scores[-1] > f1_scores[0] else 'Declining',
-        trend_loss='Improving' if losses[-1] < losses[0] else 'Declining'
-    )
-
-    # Save report
-    with open(f'{output_dir}/imputation_report.txt', 'w') as f:
-        f.write(report)
-
-    return report
+def collect_window_statistics(window):
+    """Collect statistics for a single window."""
+    chrom, start, end, variants = window
+    num_variants = len(variants)
+    missing_count = sum(1 for v in variants for gt in v.genotypes if gt[0] == -1)
+    total_genotypes = sum(len(v.genotypes) for v in variants)
+    missing_percentage = (missing_count / total_genotypes * 100) if total_genotypes > 0 else 0
+    
+    return {
+        'variants_per_window': num_variants,
+        'missing_per_window': missing_count,
+        'window_sizes': end - start,
+        'missing_percentage': missing_percentage
+    }
 
 def main():
-    """
-    Main function to run the VCF analysis and imputation pipeline.
-    """
-    # Set up logging
-    logger = setup_logger()
+    """Main function to run the imputation pipeline."""
+    # Start timing the entire pipeline
+    pipeline_start_time = time.time()
     
-    # Parse command line arguments first
     parser = argparse.ArgumentParser(description='VCF Analysis and Imputation Pipeline')
-    parser.add_argument('vcf_file', help='Path to input VCF file')
-    parser.add_argument('--window_size', type=int, default=150000, help='Window size for processing')
-    parser.add_argument('--overlap', type=float, default=0.1, help='Overlap between windows (0.1 = 10%)')
-    parser.add_argument('--output', help='Path to output VCF file')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training')
-    parser.add_argument('--num_workers', type=int, default=4, help='Number of worker processes')
-    parser.add_argument('--learning_rate', type=float, default=0.0005, help='Initial learning rate')
-    parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay for regularization')
+    parser.add_argument('vcf_file', help='Path to the input VCF file')
+    parser.add_argument('--window_size', type=int, default=150000, help='Window size in base pairs')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
+    parser.add_argument('--output_dir', type=str, default='output', help='Directory for output files')
     args = parser.parse_args()
     
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    # Initialize logging
+    log_file = os.path.join(args.output_dir, 'imputation.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger('imputation')
+
+    # Report VCF statistics
+    logger.info(f"\nAnalyzing input VCF file: {args.vcf_file}")
+    reader = cyvcf2.Reader(args.vcf_file)
+    
+    # Count variants and samples
+    num_variants = 0
+    num_samples = len(reader.samples)
+    missing_genotypes = 0
+    total_genotypes = 0
+    
+    logger.info("Counting variants and missing genotypes...")
+    for variant in tqdm(reader, desc="Reading VCF"):
+        num_variants += 1
+        for gt in variant.genotypes:
+            total_genotypes += 1
+            if gt[0] == -1:  # Missing genotype
+                missing_genotypes += 1
+    
+    # Calculate statistics
+    missing_percentage = (missing_genotypes / total_genotypes) * 100 if total_genotypes > 0 else 0
+    
+    # Report statistics
+    logger.info("\nVCF Statistics:")
+    logger.info(f"Number of samples: {num_samples}")
+    logger.info(f"Number of variants: {num_variants}")
+    logger.info(f"Total genotypes: {total_genotypes}")
+    logger.info(f"Missing genotypes: {missing_genotypes} ({missing_percentage:.2f}%)")
+    
+    # Close and reopen reader for further processing
+    reader.close()
+    
     try:
-        # Verify VCF file exists
-        if not os.path.exists(args.vcf_file):
-            raise FileNotFoundError(f"VCF file not found: {args.vcf_file}")
+        # Initialize tracking dictionaries
+        resource_history = {'gpu_memory': [], 'cpu_percent': []}
+        window_stats = {
+            'variants_per_window': [],
+            'missing_per_window': [],
+            'window_sizes': [],
+            'missing_percentage': []
+        }
+        genotype_counts = {'0/0': 0, '0/1': 0, '1/1': 0}
         
-        # Set default output path if not provided
-        if not args.output:
-            args.output = args.vcf_file.replace('.vcf', '_imputed.vcf')
-        
-        # Create windows first
-        logger.info(f"Creating windows from {args.vcf_file}...")
-        windows = create_windows(
-            args.vcf_file,
-            window_size=args.window_size,
-            overlap=args.overlap,
-            min_variants=50
-        )
-        logger.info(f"Created {len(windows)} windows")
-        
-        # Initialize imputation tracker with window ranges
-        imputation_tracker = ImputationTracker()
-        for i, (chrom, start, end, _) in enumerate(windows):
-            imputation_tracker.add_window_overlap(chrom, start, end, i)
-        
-        # Set up device and distributed training
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-            torch.backends.cudnn.benchmark = True
-            num_gpus = torch.cuda.device_count()
-            logger.info(f"Using {num_gpus} GPU(s)")
-        else:
-            device = torch.device('cpu')
-            num_gpus = 0
-            logger.info("Using CPU")
-        
-        # Initialize memory manager
-        memory_manager = MemoryManager()
-        
-        # Initialize model and training components
-        logger.info("Initializing model and training components...")
-        model = ImputationModel(
-            input_size=6,
-            hidden_size=512,
-            nhead=8,
-            num_layers=6,
-            dropout=0.3
-        ).to(device)
-        
-        if num_gpus > 1:
-            model = nn.DataParallel(model)
-        
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-            betas=(0.9, 0.999)
-        )
-        
-        criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-        early_stopping = EarlyStopping(patience=7)
-        
-        logger.info("Starting window processing...")
-        # Process windows with transfer learning
-        total_variants = 0
-        total_missing = 0
-        total_imputed = 0
-        window_stats = []
-        failed_windows = []
-        previous_model_state = None
-        
-        # Create initial VCF writer
+        # Collect initial genotype distribution
         reader = cyvcf2.Reader(args.vcf_file)
-        num_samples = len(reader.samples)
-        writer = cyvcf2.Writer(args.output, reader)
-        
-        # Keep track of processed variants to avoid duplicates
-        processed_variants = set()
-        imputed_variants = set()  # Track which variants have been imputed
-        
-        # First pass to count total missing genotypes
-        logger.info("Counting total missing genotypes...")
         for variant in reader:
-            total_variants += 1
-            missing_count = sum(1 for g in variant.genotypes if g[0] == -1)
-            total_missing += missing_count
-        reader = cyvcf2.Reader(args.vcf_file)  # Reset reader
+            for gt in variant.genotypes:
+                if gt[0] != -1:
+                    if gt[0] == 0 and gt[1] == 0:
+                        genotype_counts['0/0'] += 1
+                    elif (gt[0] == 0 and gt[1] == 1) or (gt[0] == 1 and gt[1] == 0):
+                        genotype_counts['0/1'] += 1
+                    elif gt[0] == 1 and gt[1] == 1:
+                        genotype_counts['1/1'] += 1
+        reader.close()
         
-        # Calculate percentage of missing genotypes
-        total_genotypes = total_variants * num_samples
-        missing_percentage = (total_missing / total_genotypes) * 100
+        # Create windows
+        logger.info(f"\nCreating windows from {args.vcf_file}...")
+        train_windows, test_windows = create_windows(
+            args.vcf_file,
+            window_size=args.window_size
+        )
         
-        logger.info(f"Dataset statistics:")
-        logger.info(f"Number of samples: {num_samples:,}")
-        logger.info(f"Number of variants: {total_variants:,}")
-        logger.info(f"Total genotypes: {total_genotypes:,}")
-        logger.info(f"Missing genotypes: {total_missing:,} ({missing_percentage:.2f}%)")
+        if not train_windows or not test_windows:
+            raise ValueError("No valid windows created from the VCF file")
         
-        for i, window in enumerate(windows):
-            logger.info(f"Processing window {i+1}/{len(windows)}")
+        # Initialize model and optimizer
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = ImputationModel(input_dim=2, hidden_dim=256, num_layers=4, num_heads=8).to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+        
+        # Initialize metrics tracking
+        metrics_history = {
+            'train': [],
+            'val': [],
+            'test': []
+        }
+        
+        # Track best metrics
+        best_metrics = {
+            'macro_f1': 0.0,
+            'weighted_f1': 0.0,
+            'loss': float('inf')
+        }
+        
+        # Initialize timing dictionaries
+        timing_stats = {
+            'training': [],
+            'validation': [],
+            'testing': [],
+            'imputation': 0.0
+        }
+        
+        # Collect window statistics
+        for window in train_windows + test_windows:
+            stats = collect_window_statistics(window)
+            for key in window_stats:
+                window_stats[key].append(stats[key])
+        
+        # Training loop
+        logger.info("Starting training...")
+        for epoch in range(args.epochs):
+            epoch_start_time = time.time()
             
-            # Process window with transfer learning and immediate imputation
-            stats = process_window(
-                window,
-                model=model,
-                optimizer=optimizer,
-                criterion=criterion,
-                device=device,
-                early_stopping=early_stopping,
-                memory_manager=memory_manager,
-                args=args,  # Pass args to process_window
-                logger=logger,
-                previous_model_state=previous_model_state,
-                imputation_tracker=imputation_tracker
-            )
+            model.train()
+            epoch_train_metrics = []
             
-            if stats:
-                window_stats.append(stats)
-                # Save model state for next window
-                previous_model_state = stats['model_state']
-                logger.info(f"Window {i+1} completed with accuracy: {stats['accuracy']:.4f}, loss: {stats['loss']:.4f}")
+            # Training phase with tqdm
+            train_pbar = tqdm(train_windows, desc=f'Epoch {epoch+1}/{args.epochs} [Train]')
+            for window in train_pbar:
+                metrics = process_window(window, model, device, is_training=True, logger=logger, optimizer=optimizer)
+                epoch_train_metrics.append(metrics)
                 
-                # Write imputed variants immediately after processing this window
-                chrom, start, end, variants = window
-                window_imputed = 0
-                for variant in variants:
-                    variant_key = (variant.CHROM, variant.POS)
-                    if variant_key not in processed_variants:
-                        imputed_genotypes = imputation_tracker.get_imputed_genotypes(variant.CHROM, variant.POS)
-                        if imputed_genotypes is not None:
-                            # Count only newly imputed genotypes
-                            original_missing = sum(1 for g in variant.genotypes if g[0] == -1)
-                            imputed_missing = sum(1 for g in imputed_genotypes if g[0] == -1)
-                            newly_imputed = original_missing - imputed_missing
-                            if newly_imputed > 0 and variant_key not in imputed_variants:
-                                window_imputed += newly_imputed
-                                imputed_variants.add(variant_key)
-                            variant.genotypes = imputed_genotypes
-                        writer.write_record(variant)
-                        processed_variants.add(variant_key)
+                # Update progress bar with current metrics
+                train_pbar.set_postfix({
+                    'loss': f"{metrics['loss']:.4f}",
+                    'macro_f1': f"{metrics['macro_f1']:.4f}",
+                    'weighted_f1': f"{metrics['weighted_f1']:.4f}"
+                })
                 
-                total_imputed += window_imputed
+                # Clear GPU memory if available
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Calculate average training metrics
+            avg_train_metrics = {
+                k: np.mean([m[k] for m in epoch_train_metrics]) 
+                for k in epoch_train_metrics[0].keys() 
+                if k != 'confusion_matrix'
+            }
+            metrics_history['train'].append(avg_train_metrics)
+            
+            # Monitor resources
+            resources = monitor_resources()
+            resource_history['gpu_memory'].append(resources['gpu_memory'])
+            resource_history['cpu_percent'].append(resources['cpu_percent'])
+            
+            # Validation phase with tqdm
+            val_start_time = time.time()
+            model.eval()
+            epoch_val_metrics = []
+            val_pbar = tqdm(train_windows, desc=f'Epoch {epoch+1}/{args.epochs} [Val]')
+            for window in val_pbar:
+                metrics, _ = process_window(window, model, device, is_training=False, logger=logger)
+                epoch_val_metrics.append(metrics)
                 
-                # Log imputation progress
-                if logger:
-                    logger.info(f"Window {i+1} imputation stats:")
-                    logger.info(f"Variants processed: {len(variants)}")
-                    logger.info(f"Newly imputed in this window: {window_imputed}")
-                    logger.info(f"Total imputed so far: {total_imputed:,}")
-                    logger.info(f"Imputation rate: {(total_imputed/total_missing*100 if total_missing > 0 else 0):.1f}%")
+                # Update progress bar with current metrics
+                val_pbar.set_postfix({
+                    'loss': f"{metrics['loss']:.4f}",
+                    'macro_f1': f"{metrics['macro_f1']:.4f}",
+                    'weighted_f1': f"{metrics['weighted_f1']:.4f}"
+                })
+                
+                # Clear GPU memory if available
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Calculate average validation metrics
+            avg_val_metrics = {
+                k: np.mean([m[k] for m in epoch_val_metrics]) 
+                for k in epoch_val_metrics[0].keys() 
+                if k != 'confusion_matrix'
+            }
+            metrics_history['val'].append(avg_val_metrics)
+            
+            # Update best metrics
+            if avg_val_metrics['macro_f1'] > best_metrics['macro_f1']:
+                best_metrics['macro_f1'] = avg_val_metrics['macro_f1']
+            if avg_val_metrics['weighted_f1'] > best_metrics['weighted_f1']:
+                best_metrics['weighted_f1'] = avg_val_metrics['weighted_f1']
+            if avg_val_metrics['loss'] < best_metrics['loss']:
+                best_metrics['loss'] = avg_val_metrics['loss']
+            
+            # Calculate timing for this epoch
+            epoch_time = time.time() - epoch_start_time
+            val_time = time.time() - val_start_time
+            train_time = epoch_time - val_time
+            
+            timing_stats['training'].append(train_time)
+            timing_stats['validation'].append(val_time)
+            
+            # Log epoch summary with best metrics and timing
+            logger.info(f"\nEpoch {epoch+1}/{args.epochs} Summary:")
+            logger.info("Training Metrics:")
+            for k, v in avg_train_metrics.items():
+                logger.info(f"  {k}: {v:.4f}")
+            logger.info("Validation Metrics:")
+            for k, v in avg_val_metrics.items():
+                logger.info(f"  {k}: {v:.4f}")
+            logger.info("Best Metrics So Far:")
+            for k, v in best_metrics.items():
+                logger.info(f"  {k}: {v:.4f}")
+            logger.info(f"Timing:")
+            logger.info(f"  Training time: {train_time:.2f} seconds")
+            logger.info(f"  Validation time: {val_time:.2f} seconds")
+            logger.info(f"  Total epoch time: {epoch_time:.2f} seconds")
+        
+        # Test phase with tqdm
+        logger.info("\nEvaluating on test set...")
+        test_start_time = time.time()
+        model.eval()
+        test_metrics = []
+        
+        test_pbar = tqdm(test_windows, desc='Test Phase')
+        for window in test_pbar:
+            metrics, _ = process_window(window, model, device, is_training=False, logger=logger)
+            test_metrics.append(metrics)
+            
+            # Update progress bar with current metrics
+            test_pbar.set_postfix({
+                'loss': f"{metrics['loss']:.4f}",
+                'macro_f1': f"{metrics['macro_f1']:.4f}",
+                'weighted_f1': f"{metrics['weighted_f1']:.4f}"
+            })
+            
+            # Clear GPU memory if available
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Calculate average test metrics
+        avg_test_metrics = {
+            k: np.mean([m[k] for m in test_metrics]) 
+            for k in test_metrics[0].keys() 
+            if k != 'confusion_matrix'
+        }
+        
+        # Add confusion matrix to test metrics
+        avg_test_metrics['confusion_matrix'] = np.sum([m['confusion_matrix'] for m in test_metrics], axis=0)
+        metrics_history['test'] = avg_test_metrics
+        
+        # Record test timing
+        test_time = time.time() - test_start_time
+        timing_stats['testing'].append(test_time)
+        logger.info(f"\nTest Phase Summary:")
+        logger.info(f"Test time: {test_time:.2f} seconds")
+        for k, v in avg_test_metrics.items():
+            if k != 'confusion_matrix':
+                logger.info(f"  {k}: {v:.4f}")
             else:
-                failed_windows.append(i)
-                logger.warning(f"Window {i+1} failed to process")
+                logger.info(f"  {k}:")
+                logger.info(f"    {v}")
+
+        # Generate all plots
+        plot_resource_usage(resource_history, args.output_dir)
+        plot_window_statistics(window_stats, args.output_dir)
+        plot_genotype_distribution(genotype_counts, args.output_dir)
+        
+        # Write imputed VCF using windows
+        output_vcf = os.path.join(args.output_dir, 'imputed.vcf.gz')
+        logger.info(f"\nWriting imputed genotypes to {output_vcf}")
+
+        # Start timing imputation
+        imputation_start_time = time.time()
+
+        # Read header once
+        header_lines = []
+        with gzip.open(args.vcf_file, 'rt') as f:
+            for line in f:
+                if line.startswith('#'):
+                    header_lines.append(line)
+                else:
+                    break
+
+        # Write header
+        with gzip.open(output_vcf, 'wt') as out_vcf:
+            out_vcf.writelines(header_lines)
+
+        # Process and write variants in windows
+        logger.info("Processing and writing variants in windows...")
+        
+        # Create windows for the entire VCF
+        all_windows = []
+        current_chrom = None
+        current_window = []
+        window_start = None
+        window_end = None
+        
+        reader = cyvcf2.Reader(args.vcf_file)
+        for variant in reader:
+            if variant.gt_types is None:
+                continue
+                
+            if current_chrom is None:
+                current_chrom = variant.CHROM
+                window_start = variant.POS
+                window_end = window_start + args.window_size
             
-            memory_manager.check_memory()
+            # If we're on a new chromosome or past the window end, save current window and start new one
+            if variant.CHROM != current_chrom or variant.POS >= window_end:
+                if current_window:  # Save window if it has variants
+                    all_windows.append((current_chrom, window_start, window_end, current_window))
+                
+                # Start new window
+                current_chrom = variant.CHROM
+                window_start = variant.POS
+                window_end = window_start + args.window_size
+                current_window = []
             
-            # Save checkpoint periodically
-            if (i + 1) % 5 == 0:
-                checkpoint_path = f'temp/checkpoint_window_{i+1}.pt'
-                checkpoint_model(model, optimizer, i+1, stats['loss'] if stats else float('inf'), checkpoint_path)
-                logger.info(f"Saved checkpoint at window {i+1}")
+            # Add variant if it has any genotype information
+            if len(variant.gt_types) > 0:
+                current_window.append(variant)
         
-        # Close the VCF writer
-        writer.close()
+        # Save the last window
+        if current_window:
+            all_windows.append((current_chrom, window_start, window_end, current_window))
         
-        # Generate reports and visualizations
-        if window_stats:
-            report = generate_reports(window_stats)
-            logger.info("Generated comprehensive reports and visualizations")
-            logger.info("\n" + report)
+        reader.close()
+
+        # Process and write each window
+        with gzip.open(output_vcf, 'at') as out_vcf:  # 'at' for append text mode
+            for window in tqdm(all_windows, desc="Processing windows"):
+                chrom, start, end, variants = window
+                
+                # Skip if no variants in window
+                if not variants:
+                    continue
+                
+                # Process window
+                features, positions, _, _ = extract_features(variants)
+                features = features.to(device)
+                positions = positions.to(device)
+                
+                with torch.no_grad():
+                    outputs = model(features, positions)
+                    predictions = torch.argmax(outputs, dim=-1)
+                
+                # Write variants in this window
+                for i, variant in enumerate(variants):
+                    gt_strs = []
+                    for j, gt in enumerate(variant.genotypes):
+                        if gt[0] == -1:  # Missing genotype
+                            pred = predictions[j, i].item()
+                            if pred == 0:
+                                gt_strs.append('0/0')
+                            elif pred == 1:
+                                gt_strs.append('0/1')
+                            elif pred == 2:
+                                gt_strs.append('1/1')
+                        else:
+                            gt_strs.append(f'{gt[0]}/{gt[1]}')
+                    
+                    vcf_line = [
+                        variant.CHROM,
+                        str(variant.POS),
+                        variant.ID if variant.ID else '.',
+                        variant.REF,
+                        ','.join(variant.ALT),
+                        str(variant.QUAL) if variant.QUAL is not None else '.',
+                        variant.FILTER if variant.FILTER else '.',
+                        variant.INFO.get('INFO', '.'),
+                        'GT',
+                        '\t'.join(gt_strs)
+                    ]
+                    out_vcf.write('\t'.join(vcf_line) + '\n')
+                
+                # Clear GPU memory after each window
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
-        logger.info("Pipeline completed successfully!")
-        logger.info(f"Number of samples: {num_samples:,}")
-        logger.info(f"Number of variants: {total_variants:,}")
-        logger.info(f"Total genotypes: {total_genotypes:,}")
-        logger.info(f"Missing genotypes: {total_missing:,} ({missing_percentage:.2f}%)")
-        logger.info(f"Total genotypes imputed: {total_imputed:,}")
-        logger.info(f"Final imputation rate: {(total_imputed/total_missing*100 if total_missing > 0 else 0):.1f}%")
+        # Record imputation timing
+        timing_stats['imputation'] = time.time() - imputation_start_time
+        logger.info(f"VCF writing completed in {timing_stats['imputation']:.2f} seconds")
+        
+        # Calculate and report total pipeline timing
+        total_time = time.time() - pipeline_start_time
+        avg_train_time = np.mean(timing_stats['training'])
+        avg_val_time = np.mean(timing_stats['validation'])
+        avg_test_time = np.mean(timing_stats['testing'])
+        
+        logger.info("\nPipeline Timing Summary:")
+        logger.info(f"Total pipeline time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+        logger.info(f"Average training time per epoch: {avg_train_time:.2f} seconds")
+        logger.info(f"Average validation time per epoch: {avg_val_time:.2f} seconds")
+        logger.info(f"Average test time: {avg_test_time:.2f} seconds")
+        logger.info(f"Imputation time: {timing_stats['imputation']:.2f} seconds")
         
     except Exception as e:
         logger.error(f"Error in main pipeline: {str(e)}")
         logger.error(traceback.format_exc())
         sys.exit(1)
-    finally:
-        memory_manager.cleanup()
-        cleanup_checkpoints('temp')
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    main() 
+    main()
