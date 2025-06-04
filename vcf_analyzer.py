@@ -654,7 +654,7 @@ def process_window(window, model, device, is_training=True, logger=None, optimiz
             logger.error(f"Error processing window: {str(e)}")
         return {'loss': 0.0, 'accuracy': 0.0, 'macro_f1': 0.0, 'confusion_matrix': np.zeros((3, 3))}
 
-def create_windows(vcf_file, window_size=100000):
+def create_windows(vcf_file, window_size=150000):
     """Create windows from VCF file for transformer-based imputation."""
     print(f"\nCreating windows of size {window_size:,} bp")
     
@@ -795,6 +795,160 @@ def collect_window_statistics(window):
         'missing_percentage': missing_percentage
     }
 
+def plot_test_metrics(test_metrics, output_dir):
+    """Plot all test metrics in a single bar plot."""
+    plt.figure(figsize=(12, 6))
+    
+    # Prepare data
+    metrics = ['Accuracy', 'Macro F1', 'Weighted F1', 
+              'Macro Precision', 'Weighted Precision',
+              'Macro Recall', 'Weighted Recall']
+    values = [test_metrics['accuracy'],
+             test_metrics['macro_f1'],
+             test_metrics['weighted_f1'],
+             test_metrics['macro_precision'],
+             test_metrics['weighted_precision'],
+             test_metrics['macro_recall'],
+             test_metrics['weighted_recall']]
+    
+    # Create color map
+    colors = ['#2ecc71', '#3498db', '#2980b9',  # Greens and blues for F1
+             '#e74c3c', '#c0392b',  # Reds for Precision
+             '#f1c40f', '#f39c12']  # Yellows for Recall
+    
+    # Create bar plot
+    bars = plt.bar(metrics, values, color=colors)
+    
+    # Customize plot
+    plt.title('Test Metrics Summary', pad=20)
+    plt.ylabel('Score')
+    plt.ylim(0, 1)  # Set y-axis limit from 0 to 1
+    
+    # Rotate x-axis labels for better readability
+    plt.xticks(rotation=45, ha='right')
+    
+    # Add value labels on top of each bar
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.3f}',
+                ha='center', va='bottom')
+    
+    # Adjust layout to prevent label cutoff
+    plt.tight_layout()
+    
+    # Save plot
+    plt.savefig(os.path.join(output_dir, 'test_metrics.png'))
+    plt.close()
+
+def plot_test_metrics_per_window(test_metrics_list, output_dir):
+    """Plot test metrics (macro and weighted) for each window."""
+    plt.figure(figsize=(15, 10))
+    
+    # Extract metrics for each window
+    windows = range(len(test_metrics_list))
+    macro_f1 = [m['macro_f1'] for m in test_metrics_list]
+    weighted_f1 = [m['weighted_f1'] for m in test_metrics_list]
+    macro_precision = [m['macro_precision'] for m in test_metrics_list]
+    weighted_precision = [m['weighted_precision'] for m in test_metrics_list]
+    macro_recall = [m['macro_recall'] for m in test_metrics_list]
+    weighted_recall = [m['weighted_recall'] for m in test_metrics_list]
+    
+    # Create subplots
+    plt.subplot(3, 1, 1)
+    plt.plot(windows, macro_f1, 'b-', label='Macro F1')
+    plt.plot(windows, weighted_f1, 'r-', label='Weighted F1')
+    plt.title('F1 Scores per Window')
+    plt.xlabel('Window Index')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(3, 1, 2)
+    plt.plot(windows, macro_precision, 'b-', label='Macro Precision')
+    plt.plot(windows, weighted_precision, 'r-', label='Weighted Precision')
+    plt.title('Precision Scores per Window')
+    plt.xlabel('Window Index')
+    plt.ylabel('Precision')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(3, 1, 3)
+    plt.plot(windows, macro_recall, 'b-', label='Macro Recall')
+    plt.plot(windows, weighted_recall, 'r-', label='Weighted Recall')
+    plt.title('Recall Scores per Window')
+    plt.xlabel('Window Index')
+    plt.ylabel('Recall')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'test_metrics_per_window.png'))
+    plt.close()
+
+def plot_metrics_vs_missing(test_metrics_list, window_stats, output_dir):
+    """Plot macro and weighted metrics against missing genotype percentage for each window."""
+    try:
+        # Get missing percentages for test windows
+        missing_percentages = window_stats['missing_percentage']
+        
+        # Ensure we use the same number of windows for both metrics and missing percentages
+        n_windows = min(len(missing_percentages), len(test_metrics_list))
+        missing_percentages = missing_percentages[:n_windows]
+        
+        # Extract metrics for each window
+        macro_f1 = [m['macro_f1'] for m in test_metrics_list[:n_windows]]
+        weighted_f1 = [m['weighted_f1'] for m in test_metrics_list[:n_windows]]
+        macro_precision = [m['macro_precision'] for m in test_metrics_list[:n_windows]]
+        weighted_precision = [m['weighted_precision'] for m in test_metrics_list[:n_windows]]
+        macro_recall = [m['macro_recall'] for m in test_metrics_list[:n_windows]]
+        weighted_recall = [m['weighted_recall'] for m in test_metrics_list[:n_windows]]
+        
+        plt.figure(figsize=(15, 10))
+        
+        # Create subplots
+        plt.subplot(3, 1, 1)
+        plt.scatter(missing_percentages, macro_f1, c='blue', label='Macro F1', alpha=0.6)
+        plt.scatter(missing_percentages, weighted_f1, c='red', label='Weighted F1', alpha=0.6)
+        plt.title('F1 Scores vs Missing Genotype Percentage')
+        plt.xlabel('Missing Genotype Percentage')
+        plt.ylabel('F1 Score')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(3, 1, 2)
+        plt.scatter(missing_percentages, macro_precision, c='blue', label='Macro Precision', alpha=0.6)
+        plt.scatter(missing_percentages, weighted_precision, c='red', label='Weighted Precision', alpha=0.6)
+        plt.title('Precision Scores vs Missing Genotype Percentage')
+        plt.xlabel('Missing Genotype Percentage')
+        plt.ylabel('Precision')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.subplot(3, 1, 3)
+        plt.scatter(missing_percentages, macro_recall, c='blue', label='Macro Recall', alpha=0.6)
+        plt.scatter(missing_percentages, weighted_recall, c='red', label='Weighted Recall', alpha=0.6)
+        plt.title('Recall Scores vs Missing Genotype Percentage')
+        plt.xlabel('Missing Genotype Percentage')
+        plt.ylabel('Recall')
+        plt.legend()
+        plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'metrics_vs_missing.png'))
+        plt.close()
+        
+    except Exception as e:
+        print(f"\nError in plot_metrics_vs_missing: {str(e)}")
+        print(f"Number of windows in missing_percentages: {len(window_stats['missing_percentage'])}")
+        print(f"Number of windows in test_metrics_list: {len(test_metrics_list)}")
+        # Create an empty plot with error message
+        plt.figure(figsize=(15, 10))
+        plt.text(0.5, 0.5, f"Error plotting metrics: {str(e)}", 
+                ha='center', va='center', transform=plt.gca().transAxes)
+        plt.savefig(os.path.join(output_dir, 'metrics_vs_missing.png'))
+        plt.close()
+
 def main():
     """Main function to run the imputation pipeline."""
     # Start timing the entire pipeline
@@ -806,6 +960,15 @@ def main():
     parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs')
     parser.add_argument('--output_dir', type=str, default='output', help='Directory for output files')
     args = parser.parse_args()
+    
+    # Print default values and configuration
+    print("\nConfiguration:")
+    print("=" * 50)
+    print(f"Input VCF file: {args.vcf_file}")
+    print(f"Window size: {args.window_size:,} bp")
+    print(f"Number of epochs: {args.epochs}")
+    print(f"Output directory: {args.output_dir}")
+    print("=" * 50)
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1067,6 +1230,9 @@ def main():
         plot_resource_usage(resource_history, args.output_dir)
         plot_window_statistics(window_stats, args.output_dir)
         plot_genotype_distribution(genotype_counts, args.output_dir)
+        plot_test_metrics(avg_test_metrics, args.output_dir)
+        plot_test_metrics_per_window(test_metrics, args.output_dir)
+        plot_metrics_vs_missing(test_metrics, window_stats, args.output_dir)
         
         # Write imputed VCF using windows
         output_vcf = os.path.join(args.output_dir, 'imputed.vcf.gz')
