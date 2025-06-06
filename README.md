@@ -48,14 +48,14 @@ pip install -r requirements.txt
 
 Basic usage:
 ```bash
-python vcf_analyzer.py input.vcf --window_size 150000 --epochs 3 --output_dir output
+python vcf_analyzer.py input.vcf --window_size 150000 --epochs 5 --output_dir output
 ```
 
 ### Arguments
 
 - `vcf_file`: Path to the input VCF file (required)
 - `--window_size`: Window size in base pairs (default: 150000)
-- `--epochs`: Number of training epochs (default: 3)
+- `--epochs`: Number of training epochs (default: 5)
 - `--output_dir`: Directory for output files (default: 'output')
 
 ### Output
