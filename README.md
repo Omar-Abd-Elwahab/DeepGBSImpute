@@ -1,6 +1,6 @@
 # DeepGBSImpute
 
-A Reference free deep learning-based genotype imputation tool for GBS (Genotyping-by-Sequencing) data.
+DeepGBSImpute: A Reference-Free Transformer-Based Genotype Imputation Framework for Sparse Genotyping-by-Sequencing Data 
 
 ## Description
 
@@ -120,7 +120,7 @@ If you use DeepGBSImpute in your research, please cite:
 ```
 @software{DeepGBSImpute,
   author = {Omar Abd-Elwahab},
-  title = {DeepGBSImpute: A Reference-Free Deep Learning Approach for Genotype Imputation in Genotyping-by-Sequencing Data},
+  title = {DeepGBSImpute: A Reference-Free Transformer-Based Genotype Imputation Framework for Sparse Genotyping-by-Sequencing Data},
   year = {2025},
   publisher = {GitHub},
   url = {https://github.com/Omar-Abd-Elwahab/DeepGBSImpute}
