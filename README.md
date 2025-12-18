@@ -117,15 +117,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 If you use DeepGBSImpute in your research, please cite:
 
-```
-@software{DeepGBSImpute,
-  author = {Omar Abd-Elwahab},
-  title = {DeepGBSImpute: A Reference-Free Transformer-Based Genotype Imputation Framework for Sparse Genotyping-by-Sequencing Data},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/Omar-Abd-Elwahab/DeepGBSImpute}
-}
-```
+Abdelwahab, O., Torkamaneh, D. (2026). DeepGBSImpute: A Reference-Free Transformer-Based Genotype Imputation Framework for Sparse Genotyping-By-Sequencing Data. In: Rojas, I., Ortuño, F., Rojas Ruiz, F., Herrera, L.J., Valenzuela, O., Escobar, J.J. (eds) Bioinformatics and Biomedical Engineering. IWBBIO 2025. Lecture Notes in Computer Science(), vol 16050. Springer, Cham. https://doi.org/10.1007/978-3-032-08455-2_1
+
 
 ## Contact
 
